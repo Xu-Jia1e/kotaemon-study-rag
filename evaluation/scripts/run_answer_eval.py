@@ -23,6 +23,7 @@ from evaluation.scripts.validate_dataset import load_cases
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CASES = REPO_ROOT / "evaluation" / "datasets" / "qa_cases_v2.jsonl"
 DEFAULT_OUT = REPO_ROOT / "evaluation" / "results" / "answer_report.json"
+GRADING_VERSION = "grading-v1"
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -34,7 +35,9 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError as exc:
-                raise SystemExit(f"{path}:{line_number}: invalid JSON ({exc})") from exc
+                raise SystemExit(
+                    f"{path}:{line_number}: invalid JSON ({exc})"
+                ) from exc
     return records
 
 
@@ -66,14 +69,19 @@ def main(argv: list[str] | None = None) -> int:
     labels = load_jsonl(args.labels) if args.labels else []
     citation_labels = load_jsonl(args.citation_labels) if args.citation_labels else []
 
+    from evaluation.batch import sha256_file
+
     payload = {
         "config": {
             "cases": str(args.cases),
             "predictions": str(args.predictions),
             "labels": str(args.labels) if args.labels else None,
+            "labels_sha256": sha256_file(args.labels),
             "citation_labels": (
                 str(args.citation_labels) if args.citation_labels else None
             ),
+            "citation_labels_sha256": sha256_file(args.citation_labels),
+            "grading_version": GRADING_VERSION,
         },
         "answer_correctness": answer_correctness(labels),
         "refusal": evaluate_refusal(cases, predictions),
