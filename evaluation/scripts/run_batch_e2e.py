@@ -39,21 +39,50 @@ def _build_config(args: argparse.Namespace, retrieval: dict, dataset: Path) -> d
     from evaluation.adapters.c_answer import DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
     from evaluation.batch import sha256_file
 
-    index_dir = retrieval.get("index_dir")
-    index_manifest = Path(index_dir) / "index.json" if index_dir else None
-    chunking = retrieval.get("chunking") or {}
-    embedding = retrieval.get("embedding") or {}
+    nested = retrieval.get("config")
+    nested = nested if isinstance(nested, dict) else {}
+
+    chunking = nested.get("chunking")
+    if not (isinstance(chunking, str) and chunking.strip()):
+        legacy_chunking = retrieval.get("chunking")
+        if isinstance(legacy_chunking, str) and legacy_chunking.strip():
+            chunking = legacy_chunking
+        elif isinstance(legacy_chunking, dict):
+            size = legacy_chunking.get("chunk_size")
+            overlap = legacy_chunking.get("chunk_overlap")
+            chunking = f"{size}-{overlap}" if size is not None else "None-None"
+        else:
+            chunking = "None-None"
+
+    index_sha = nested.get("index_manifest_sha256")
+    if not index_sha:
+        index_dir = nested.get("index_dir") or retrieval.get("index_dir")
+        index_sha = sha256_file(Path(index_dir) / "index.json") if index_dir else None
+
+    legacy_embedding = retrieval.get("embedding")
+    legacy_embedding = legacy_embedding if isinstance(legacy_embedding, dict) else {}
+    embedding_model = (
+        nested.get("embedding_model")
+        or retrieval.get("embedding_model")
+        or legacy_embedding.get("model")
+    )
+    embedding_dimensions = (
+        nested.get("embedding_dimensions")
+        or retrieval.get("embedding_dimensions")
+        or legacy_embedding.get("dimensions")
+    )
+
     return {
         "dataset_sha256": sha256_file(dataset),
         "retrieval_sha256": sha256_file(args.retrieval),
-        "index_manifest_sha256": sha256_file(index_manifest),
-        "chunking": f"{chunking.get('chunk_size')}-{chunking.get('chunk_overlap')}",
+        "index_manifest_sha256": index_sha,
+        "chunking": chunking,
         "top_k": retrieval.get("top_k"),
         "retrieval_method": retrieval.get("mode", "vector"),
         "llm_model": DEEPSEEK_MODEL,
         "llm_endpoint": DEEPSEEK_BASE_URL,
-        "embedding_model": embedding.get("model"),
-        "embedding_dimensions": embedding.get("dimensions"),
+        "embedding_model": embedding_model,
+        "embedding_dimensions": embedding_dimensions,
         "adapter_version": ADAPTER_VERSION,
         "simulated": bool(retrieval.get("simulated")),
     }

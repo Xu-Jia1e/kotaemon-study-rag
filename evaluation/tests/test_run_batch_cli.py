@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
-from evaluation.batch import config_fingerprint
+from evaluation.batch import config_fingerprint, sha256_file
 from evaluation.scripts import run_batch_e2e
 
 DATASET = (
@@ -103,3 +104,79 @@ def test_manifest_records_hashes_and_no_secrets(tmp_path):
     assert manifest["retrieval"]["sha256"]
     assert "sk-" not in json.dumps(manifest)
     assert manifest["config_fingerprint"] == config_fingerprint(manifest["config"])
+
+
+def test_build_config_prefers_nested_retrieval_config(tmp_path):
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(DATASET, encoding="utf-8")
+    retrieval_path = tmp_path / "retrieval.json"
+    retrieval_path.write_text("{}", encoding="utf-8")
+
+    retrieval = {
+        "config": {
+            "chunking": "512-128",
+            "index_manifest_sha256": "a" * 64,
+            "embedding_model": "text-embedding-v4",
+            "embedding_dimensions": 2048,
+        },
+        "top_k": 5,
+        "mode": "vector",
+        "simulated": False,
+    }
+    config = run_batch_e2e._build_config(
+        argparse.Namespace(retrieval=retrieval_path), retrieval, dataset
+    )
+    assert config["chunking"] == "512-128"
+    assert config["index_manifest_sha256"] == "a" * 64
+    assert config["embedding_model"] == "text-embedding-v4"
+    assert config["embedding_dimensions"] == 2048
+    assert config["top_k"] == 5
+
+
+def test_build_config_falls_back_to_legacy_top_level_fields(tmp_path):
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(DATASET, encoding="utf-8")
+    retrieval_path = tmp_path / "retrieval.json"
+    retrieval_path.write_text("{}", encoding="utf-8")
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    index_manifest = index_dir / "index.json"
+    index_manifest.write_text('{"chunk_size": 1024}', encoding="utf-8")
+
+    retrieval = {
+        "index_dir": str(index_dir),
+        "chunking": {"chunk_size": 1024, "chunk_overlap": 256},
+        "embedding": {"model": "text-embedding-v4", "dimensions": 2048},
+        "top_k": 5,
+        "mode": "vector",
+        "simulated": False,
+    }
+    config = run_batch_e2e._build_config(
+        argparse.Namespace(retrieval=retrieval_path), retrieval, dataset
+    )
+    assert config["chunking"] == "1024-256"
+    assert config["index_manifest_sha256"] == sha256_file(index_manifest)
+    assert config["embedding_model"] == "text-embedding-v4"
+    assert config["embedding_dimensions"] == 2048
+
+
+def test_build_config_falls_back_per_field(tmp_path):
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(DATASET, encoding="utf-8")
+    retrieval_path = tmp_path / "retrieval.json"
+    retrieval_path.write_text("{}", encoding="utf-8")
+
+    retrieval = {
+        "config": {"chunking": "512-128"},
+        "embedding": {"model": "text-embedding-v4", "dimensions": 2048},
+        "top_k": 5,
+        "mode": "vector",
+        "simulated": False,
+    }
+    config = run_batch_e2e._build_config(
+        argparse.Namespace(retrieval=retrieval_path), retrieval, dataset
+    )
+    assert config["chunking"] == "512-128"
+    assert config["index_manifest_sha256"] is None
+    assert config["embedding_model"] == "text-embedding-v4"
+    assert config["embedding_dimensions"] == 2048
