@@ -63,6 +63,15 @@ uv sync --locked --package kotaemon --package ktem
 
 # 5. 单测（全部离线；引文用例在文档缺失时自动跳过）
 .venv/Scripts/python.exe -m pytest evaluation -q
+
+# 6. 实验矩阵状态（18 组，当前全部 blocked，不产出指标）
+.venv/Scripts/python.exe -m evaluation.scripts.run_experiment --matrix
+
+# 7. 用 synthetic fixture 验证"记录 → 报告"链路（输出带 SIMULATED 标记）
+.venv/Scripts/python.exe -m evaluation.scripts.make_simulated_fixture \
+    --out-dir .eval-tmp/fixture
+.venv/Scripts/python.exe -m evaluation.scripts.run_experiment \
+    --simulated-fixture .eval-tmp/fixture --out-dir .eval-tmp/out --k 5
 ```
 
 > 第 3、4 步用的是 `tests/fixtures/*_stub.*`，**synthetic fixture，不是实验结果**，只证明"数据集 → 适配器 → 指标 → 报告"链路通。
@@ -79,11 +88,15 @@ evaluation/
 │   ├── qa_cases.jsonl     ⚠️ 已废弃：原 6 道 search-cases，仅作历史对照
 │   └── candidates.md      v2 的选题依据与后续扩充方向
 ├── metrics/               retrieval / answer / citation 指标（纯函数）
+├── matrix.py              实验矩阵与阻塞状态（18 组）
+├── reporting.py           每题记录 + 分题型报告 + markdown 渲染
 ├── adapters/              base 协议、part_b 适配器、fixture 适配器
 ├── scripts/
 │   ├── convert_search_cases.py   v1 转换器（历史用途，仍可用）
 │   ├── validate_dataset.py       结构与规则校验
 │   ├── verify_evidence.py        引文逐字复核 + 无答案题缺失校验
+│   ├── make_simulated_fixture.py 生成 simulated fixture
+│   ├── run_experiment.py         矩阵状态 / simulated 运行
 │   ├── run_retrieval_eval.py
 │   └── run_answer_eval.py
 ├── tests/                 单测 + fixtures
@@ -123,13 +136,34 @@ evaluation/
 | `scripts/part_b_*.py` | B 的检索实验脚本；`PartBRetrievalAdapter` 通过 CLI 调用并解析 JSON，不改其代码 |
 | `kotaemon.indices.qa.utils` | C 的引用校验与拒答判定；`metrics/` **直接调用**，保证与产品行为一致 |
 
+## 实验矩阵（18 组，当前全部 blocked）
+
+| 维度 | 取值 |
+|---|---|
+| Chunking | `1024-256`、`512-128` |
+| Retrieval | `vector`、`hybrid`、`rrf` |
+| Top-K | `3`、`5`、`10` |
+| Reranking | `off`（默认）；`on` 可选且 blocked |
+
+2 × 3 × 3 = 18 组，**全部使用同一份 24 题数据集**（报告记录其 SHA-256）。
+
+当前 **0 ready / 18 blocked**，原因是：两套 chunking 索引都不在本机可查、检索需要真实 embedding key、reranker 未接入。`run_experiment --matrix` 只输状态表，**不产出任何指标**；详见 [DESIGN.md §8](DESIGN.md)。
+
+## 结果记录与报告
+
+`per_case.jsonl` 每题一条，含 `case_id`、`chunking_strategy`、`retrieval_method`、`top_k`、`retrieved_evidence`、`hit_at_k`、`reciprocal_rank`、`recall_at_k`、`generated_answer`、`answer_correct`、`citation_valid`、`citation_supported`、`refusal_correct` 等字段。
+
+报告给出 7 项指标（Hit@K、MRR、Recall@K、Answer Correctness、Citation Validity、Citation Support、Refusal Accuracy）的**总体 + 分题型**结果。`citation_valid`（编号是否存在）与 `citation_supported`（内容是否真的支持）分开统计。
+
 ## 当前状态（真实进度）
 
 - 数据集：**24/24 题**已完成，题型分布 12/6/3/3，34 条引文全部通过逐字复核。
 - 文档覆盖：hash 讲义（PDF 26 条引文、PPTX 1 条）、USTC 6 条、USST 1 条。**UTS 两份文档 403 不可得**，因此没有使用。
 - 无答案题：3 条，均记录 `checked_scope`（检查文件、方法、可机器复核的缺失证据）。
 - 适配器：`fixture` 可用；`part-b` 已实现但**尚未对真实索引运行**（需要 B 的 `--index-dir` 与本地 `.env`）。
-- 真实实验：**一条都没有跑**，`results/` 为空是符合预期的。
+- 实验矩阵：**18 组全部 blocked**（0 ready），原因见 [DESIGN.md §8](DESIGN.md)。
+- 真实实验：**一条都没有跑**，`results/` 为空是符合预期的；未完成真实检索与问答实验。
+- 代码基线：`2bed52f` + 本目录的本地提交，**尚未包含 PR #3**（C 的拒答/引用修复未合并）。
 
 ## 约定
 

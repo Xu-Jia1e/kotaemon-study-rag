@@ -5,4 +5,4 @@ and never patches or duplicates them. See ``evaluation/README.md`` for scope and
 ``evaluation/DESIGN.md`` for the metric definitions and interface findings.
 """
 
-__all__ = ["metrics", "adapters", "scripts"]
+__all__ = ["adapters", "matrix", "metrics", "reporting", "scripts"]

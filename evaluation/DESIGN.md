@@ -180,4 +180,72 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 | 指标实现 | `evaluation/metrics/*.py` | ✅ |
 | 离线单测 | `evaluation/tests/` | ✅ 全绿 |
 | 检索适配器接口 | `evaluation/adapters/base.py`、`part_b.py` | ✅（fixture 已验证，part-b 未对真实索引运行） |
+| 实验矩阵 | `evaluation/matrix.py` | ✅ 18 组，全部显式 blocked |
+| 结果记录与报告 | `evaluation/reporting.py` | ✅ 12 字段/题 + 分题型统计 |
+| Simulated 链路验证 | `evaluation/scripts/run_experiment.py` | ✅ 带 SIMULATED 标记 |
 | 真实实验结果 | — | ❌ 未运行，符合本阶段约束 |
+
+## 8. 实验矩阵与阻塞状态
+
+### 8.1 矩阵定义
+
+| 维度 | 取值 | 数量 |
+|---|---|---:|
+| Chunking | `1024-256`、`512-128` | 2 |
+| Retrieval | `vector`、`hybrid`、`rrf` | 3 |
+| Top-K | `3`、`5`、`10` | 3 |
+| Reranking | `off`（默认）；`on` 为可选 | 1 / 1 |
+
+主矩阵 = 2 × 3 × 3 = **18 组**，全部使用**同一份** `datasets/qa_cases_v2.jsonl`（24 题）。报告里记录该文件 SHA-256，避免"换了数据集却说同一组实验"。
+
+Reranking 不进入主矩阵：`on` 状态是 **blocked**（Cohere key 为空时重排原样返回；qwen3-rerank 未接入），所以不存在"已实现重排"的实验。
+
+### 8.2 各维度状态
+
+| 维度取值 | 状态 | 原因 | 依据 |
+|---|---|---|---|
+| chunking `1024-256` | blocked | 本机没有 A 的主库索引；Part B 自建索引是**按页**抽文本，不是 1024/256 token 分块 | `docs/part-b-retrieval.md`、`libs/ktem/ktem/index/file/pipelines.py:788` |
+| chunking `512-128` | blocked | A 未提供第二套索引，也没有可复现的分块参数记录 | 本文件 §6 |
+| retrieval `vector` | blocked | 需要索引 + `DASHSCOPE_API_KEY`；本阶段不调真实 API | `scripts/part_b_retrieval.py:134` |
+| retrieval `hybrid` | blocked | 同上；且混合检索无分数融合，只能比排名类指标 | `vectorindex.py:224` |
+| retrieval `rrf` | blocked | RRF 只在 B 的脚本里，仍需索引与 key | `scripts/part_b_retrieval.py:41` |
+| reranking `off` | ready | 不使用重排；需把候选深度固定为 `top_k`，避免 `do_extend` 隐式放大 | `pipelines.py:156` |
+| reranking `on` | blocked | 无可用 reranker | `rankings/cohere.py:41` |
+
+结果：**18 组全部 blocked，0 ready**。`run_experiment --matrix` 只输出状态，不产出任何指标。
+
+### 8.3 每道题的结果记录
+
+`per_case.jsonl` 每条 = 一道题 × 一个实验组，字段：
+
+`case_id`、`category`、`chunking_strategy`、`retrieval_method`、`top_k`、`reranking`、`simulated`、`retrieved_evidence`、`hit_at_k`、`reciprocal_rank`、`recall_at_k`、`generated_answer`、`answer_correct`、`citation_valid`、`citation_supported`、`refusal_correct`、`expected_refusal`、`citation_support_supported`、`citation_support_total`。
+
+- `citation_valid`：编号存在性（自动，复用 C 的 `validate_citations`）；
+- `citation_supported`：`supported` / `unsupported` / `mixed`，来自人工逐条标注；
+- 二者**分开存储、分开统计**，编号合法不代表内容支持。
+
+### 8.4 报告统计
+
+支持 7 项：`Hit@K`、`MRR`、`Recall@K`、`Answer Correctness`、`Citation Validity`、`Citation Support`、`Refusal Accuracy`，并额外给出 `false_refusal_rate`、`balanced_accuracy`。
+
+每种指标同时给出**总体**与**分题型**（direct / synthesis / detail / unanswerable）。无样本或无标签时输出 `—`（`null`），不按 0 计算。
+
+### 8.5 Simulated 政策
+
+`synthetic fixture` 只用于验证"矩阵 → 记录 → 报告"链路：
+
+- 生成器 `make_simulated_fixture.py` 的每个输出都带 `"simulated": true`；
+- 报告顶部有 `SIMULATED — synthetic fixture, NOT experimental results` 横幅；
+- 报告配置里的 chunking / retrieval 写成 `SIMULATED-*`，不可能被误读成真实配置；
+- `run_experiment` 拒绝加载未标记 `simulated` 的 fixture。
+
+`evaluation/results/` 里**没有**任何真实或模拟结果入库；验证产物写到仓库外。
+
+### 8.6 当前结论（明确声明）
+
+1. 正式测试集是 `datasets/qa_cases_v2.jsonl`，**24 题**（12 直接 / 6 综合 / 3 细节 / 3 无答案）。
+2. 数据来源只有 **4 份可读取文档**：`11-hash2.pdf`、`11-hash2.pptx`、`USTC-ClassIn.pdf`、`USST-syllabus.docx`。
+3. `UTS-accessible-word.docx` 与 `UTS-accessible-powerpoint.pptx` 因源站 **HTTP 403 未纳入**。
+4. **尚未完成任何真实检索或问答实验**：18 组实验全部 blocked，`results/` 为空。
+5. 本地代码基线为 `2bed52f`（加上 D 自己的 evaluation 提交），**尚未包含 PR #3**；因此 C 的"纯拒答被判 citation_valid=False"等缺陷仍存在，引用指标必须剔除拒答样本（已实现）。
+
