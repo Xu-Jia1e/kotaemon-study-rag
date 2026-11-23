@@ -221,10 +221,11 @@ class VectorRetrieval(BaseRetrieval):
                 vector_result.result()
                 text_result.result()
 
+            vector_ids = set(vs_ids)
             result = [
                 RetrievedDocument(**doc.to_dict(), score=-1.0)
                 for doc in ds_docs
-                if doc not in vs_ids
+                if doc.doc_id not in vector_ids
             ]
             result += [
                 RetrievedDocument(**doc.to_dict(), score=score)
@@ -245,53 +246,50 @@ class VectorRetrieval(BaseRetrieval):
         print(f"Got raw {len(result)} retrieved documents")
 
         # add page thumbnails to the result if exists
-        thumbnail_doc_ids: set[str] = set()
-        # we should copy the text from retrieved text chunk
-        # to the thumbnail to get relevant LLM score correctly
-        text_thumbnail_docs: dict[str, RetrievedDocument] = {}
-
-        non_thumbnail_docs = []
+        thumbnail_doc_ids: list[str] = []
         raw_thumbnail_docs = []
         for doc in result:
             if doc.metadata.get("type") == "thumbnail":
-                # change type to image to display on UI
                 doc.metadata["type"] = "image"
                 raw_thumbnail_docs.append(doc)
                 continue
+            thumbnail_id = doc.metadata.get("thumbnail_doc_id")
             if (
-                "thumbnail_doc_id" in doc.metadata
+                thumbnail_id
+                and thumbnail_id not in thumbnail_doc_ids
                 and len(thumbnail_doc_ids) < thumbnail_count
             ):
-                thumbnail_id = doc.metadata["thumbnail_doc_id"]
-                thumbnail_doc_ids.add(thumbnail_id)
-                text_thumbnail_docs[thumbnail_id] = doc
-            else:
-                non_thumbnail_docs.append(doc)
+                thumbnail_doc_ids.append(thumbnail_id)
 
-        linked_thumbnail_docs = self.doc_store.get(list(thumbnail_doc_ids))
+        linked_thumbnail_docs = self.doc_store.get(thumbnail_doc_ids)
+        thumbnails_by_id = {doc.doc_id: doc for doc in linked_thumbnail_docs}
         print(
             "thumbnail docs",
             len(linked_thumbnail_docs),
-            "non-thumbnail docs",
-            len(non_thumbnail_docs),
             "raw-thumbnail docs",
             len(raw_thumbnail_docs),
         )
-        additional_docs = []
-
-        for thumbnail_doc in linked_thumbnail_docs:
-            text_doc = text_thumbnail_docs[thumbnail_doc.doc_id]
+        ordered_docs = []
+        for text_doc in result:
+            if any(text_doc is raw_doc for raw_doc in raw_thumbnail_docs):
+                continue
+            thumbnail_doc = thumbnails_by_id.get(
+                text_doc.metadata.get("thumbnail_doc_id")
+            )
+            if thumbnail_doc is None:
+                ordered_docs.append(text_doc)
+                continue
             doc_dict = thumbnail_doc.to_dict()
-            doc_dict["_id"] = text_doc.doc_id
+            doc_dict["id_"] = text_doc.doc_id
+            doc_dict["text"] = text_doc.text
             doc_dict["content"] = text_doc.content
             doc_dict["metadata"]["type"] = "image"
             for key in text_doc.metadata:
                 if key not in doc_dict["metadata"]:
                     doc_dict["metadata"][key] = text_doc.metadata[key]
+            ordered_docs.append(RetrievedDocument(**doc_dict, score=text_doc.score))
 
-            additional_docs.append(RetrievedDocument(**doc_dict, score=text_doc.score))
-
-        result = additional_docs + non_thumbnail_docs
+        result = ordered_docs
 
         if not result:
             # return output from raw retrieved thumbnails

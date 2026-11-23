@@ -17,7 +17,16 @@ def read_image_text(
     """Recognize text in a raster image with the local OCR model."""
     with _ocr_lock:
         engine = _ocr()
-        output = engine(image, use_det=False, use_cls=False) if single_line else engine(image)
+        if single_line:
+            output = engine(image, use_det=False, use_cls=False)
+        else:
+            # RapidOCR retains call-time flags on the cached engine. Restore the
+            # configured defaults after a single-line call before reading an image.
+            output = engine(
+                image,
+                use_det=engine.cfg.Global.use_det,
+                use_cls=engine.cfg.Global.use_cls,
+            )
     texts = [text.strip() for text in (getattr(output, "txts", None) or ())]
     if group_labels and len(texts) > 2 and output.boxes is not None:
         _group_wrapped_labels(texts, output.boxes)
