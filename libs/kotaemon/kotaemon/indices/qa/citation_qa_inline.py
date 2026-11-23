@@ -11,7 +11,7 @@ from kotaemon.llms import PromptTemplate
 
 from .citation_qa import CITATION_TIMEOUT, MAX_IMAGES, AnswerWithContextPipeline
 from .format_context import EVIDENCE_MODE_FIGURE
-from .utils import find_start_end_phrase
+from .utils import ABSTAIN_MARKER, find_start_end_phrase, validate_citations
 
 DEFAULT_QA_CITATION_PROMPT = """
 Use the following pieces of context to answer the question at the end.
@@ -149,7 +149,7 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
 
         return citations
 
-    def replace_citation_with_link(self, answer: str):
+    def replace_citation_with_link(self, answer: str, max_id: int | None = None):
         # Define the regex pattern to match 【number】
         pattern = r"【\d+】"
         alternate_pattern = r"\[\d+\]"
@@ -178,6 +178,10 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
 
         for citation in matched_citations:
             citation_id = citation[1:-1]
+            if max_id is not None and not 1 <= int(citation_id) <= max_id:
+                # Drop out-of-range citations instead of rendering a broken link.
+                answer = answer.replace(citation, f"【{citation_id}】")
+                continue
             answer = answer.replace(
                 citation,
                 (
@@ -203,6 +207,13 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
         # check if evidence exists, use QA prompt
         if evidence:
             prompt, evidence = self.get_prompt(question, evidence, evidence_mode)
+        elif self.enable_abstention:
+            # No retrieved evidence: instruct the model to abstain instead of
+            # answering from its own parametric knowledge.
+            prompt = (
+                f"{ABSTAIN_MARKER} Reply with exactly that sentence and do not "
+                f"add any citations.\n\nQuestion: {question}\nANSWER:"
+            )
         else:
             prompt = question
 
@@ -299,6 +310,21 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
         if mindmap_thread:
             mindmap_thread.join(timeout=CITATION_TIMEOUT)
 
+        citation_validation = None
+        max_id: int | None = None
+        if self.enable_citation_validation and evidence:
+            validation = validate_citations(final_answer or output, self.evidence_index)
+            citation_validation = validation.to_dict()
+            if self.evidence_index:
+                max_id = max(
+                    (
+                        entry["index"]
+                        for entry in self.evidence_index
+                        if isinstance(entry.get("index"), int)
+                    ),
+                    default=None,
+                )
+
         # convert citation to link
         answer = Document(
             text=final_answer,
@@ -306,12 +332,14 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
                 "citation_viz": self.enable_citation_viz,
                 "mindmap": mindmap,
                 "citation": citation,
+                "citation_status": "ok",
+                "citation_validation": citation_validation,
                 "qa_score": qa_score,
             },
         )
 
         # yield the final answer
-        final_answer = self.replace_citation_with_link(final_answer)
+        final_answer = self.replace_citation_with_link(final_answer, max_id)
 
         if final_answer:
             yield Document(channel="chat", content=None)
