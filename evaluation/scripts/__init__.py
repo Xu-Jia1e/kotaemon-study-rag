@@ -5,4 +5,5 @@ __all__ = [
     "run_answer_eval",
     "run_retrieval_eval",
     "validate_dataset",
+    "verify_evidence",
 ]

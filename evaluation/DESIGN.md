@@ -113,9 +113,28 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 
 见 `datasets/schema.md`。要点：
 
-- 证据锚定 `file + locator(kind, value)`，`quote` 未核对必须为 `null` + `quote_status=pending`。
-- 支持证据组：同组可选、跨组必中。
-- 6 道 search-cases 已转换（`sc-01`…`sc-06`），9 个证据单元、8 个组，**9 处 quote 待补**。
+- 证据锚定 `file + locator(kind, value)`；答案类题目要求 `quote` 逐字可复核（`evidence_status=quote_verified`）。
+- 支持证据组：同组可选、跨组必中，用于双证据/多问句题。
+- 无答案题必须带 `checked_scope`（检查了哪些文件、用什么方法、可机器复核的缺失证据）。
+
+**正式数据集 `qa_cases_v2.jsonl`：24 题**，分布 `direct 12 / synthesis 6 / detail 3 / unanswerable 3`，共 34 条证据引文。
+
+数据来源是 4 份校验过 SHA-256 的真实文档：`11-hash2.pdf`（37 页）、`11-hash2.pptx`（37 张）、`USTC-ClassIn.pdf`（16 页）、`USST-syllabus.docx`（模板）。
+
+选题约束（避免"看起来合理但没依据"的题）：
+
+1. 只使用 **文本层可提取** 的内容。PDF 里的公式排版、槽位示意表在文本层是乱序的，凡无法逐字核对的片段一律不出题。
+2. `USST-syllabus.docx` 是空白模板，只有"桥梁工程的基本知识（示例）"一行有真实内容，因此只从该行出题（学生两项任务），另出一道无答案题（学分/学时字段为空）。
+3. `unanswerable` 题必须能机器验证"缺失"：`absent_phrases` 在全库无命中、`max_mentions` 限制提及次数（如 cuckoo 仅出现 1 次且只有名称）、或 `blank_fields` 断言字段行不含数字。
+
+复核命令：
+
+```sh
+.venv/Scripts/python.exe -m evaluation.scripts.verify_evidence
+# -> 24 cases, 34 evidence quotes, 4 documents loaded, 0 error(s)
+```
+
+`datasets/qa_cases.jsonl`（原 6 道 search-cases）已废弃，仅作历史对照。
 
 ## 4. 已知风险与设计决策
 
@@ -156,9 +175,9 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 | 交付物 | 位置 | 状态 |
 |---|---|---|
 | 统一数据格式 | `evaluation/datasets/schema.md` | ✅ |
-| 6 道 search-cases 转换 | `evaluation/datasets/qa_cases.jsonl`（由脚本生成） | ✅（原文片段待补） |
+| 24 题正式数据集 | `evaluation/datasets/qa_cases_v2.jsonl` | ✅ 12/6/3/3，34 条引文逐字复核 |
+| 引文复核工具 | `evaluation/scripts/verify_evidence.py` | ✅ 0 error |
 | 指标实现 | `evaluation/metrics/*.py` | ✅ |
-| 离线单测 | `evaluation/tests/`（34 项） | ✅ 全绿 |
+| 离线单测 | `evaluation/tests/` | ✅ 全绿 |
 | 检索适配器接口 | `evaluation/adapters/base.py`、`part_b.py` | ✅（fixture 已验证，part-b 未对真实索引运行） |
-| 20+ 题扩充方案 | `evaluation/datasets/candidates.md` | ✅（方案，非已编造题目） |
 | 真实实验结果 | — | ❌ 未运行，符合本阶段约束 |

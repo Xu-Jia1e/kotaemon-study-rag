@@ -4,7 +4,37 @@
 
 - 不修改 `libs/kotaemon/`、`libs/ktem/`、`app.py` 等核心代码，只以库的方式调用。
 - 不调用任何真实模型 API。指标全部是纯函数，可从录制的预测结果离线计算。
-- **不编造数据**：真实实验数字只来自实际运行；缺失的原文片段一律标 `pending`，留空等待补录。
+- **不编造数据**：每条引文都必须能在原文指定页/张里逐字匹配（`verify_evidence.py` 会失败，如果匹配不上）。
+
+## 正式数据集：`datasets/qa_cases_v2.jsonl`
+
+24 道题，全部基于**已校验的真实文档**，每题都有文档名、页码/幻灯片号、章节或表格行，以及原文片段。
+
+| 题型 | 数量 | 说明 |
+|---|---:|---|
+| `direct` 直接事实题 | 12 | 单个证据点、答案在原文中直接给出 |
+| `synthesis` 综合理解题 | 6 | 每题 ≥2 个证据组，需跨页/跨段整合（例如二次探测证明三步、三种探测策略对比） |
+| `detail` 细节定位题 | 3 | 定位到具体页/张的一行或一个符号（如 long 字段哈希写法、墓碑符号 🪦） |
+| `unanswerable` 无答案题 | 3 | 知识库确实没有答案，且记录了检查范围与可机器复核的缺失证据 |
+
+> `datasets/qa_cases.jsonl`（原 6 道 search-cases 转换）**已废弃**，仅保留作历史对照，不参与任何评测。按约定不再修改或补齐。
+
+### 数据来源
+
+| 文件 | 来源 | 校验 |
+|---|---|---|
+| `11-hash2.pdf` | UW CSE 332《Hash Tables II》讲义（37 页） | SHA-256 `7aa2d367…` |
+| `11-hash2.pptx` | 同课程 PPTX 版（37 张） | SHA-256 `8d92e93c…` |
+| `USTC-ClassIn.pdf` | 中科大《线上教学操作说明》（16 页，中文） | SHA-256 `ced8a509…` |
+| `USST-syllabus.docx` | 上海理工大学课程教学大纲模板（中文，含桥梁示例行） | SHA-256 `09762a9c…` |
+
+下载与校验：
+
+```sh
+python test-materials/download_samples.py   # 前两份
+```
+
+`download_samples.py` 对 UTS 的两份文档会返回 **HTTP 403**（源站拒绝访问），因此本数据集**只使用上述 4 份**。实测结论已记录在 `DESIGN.md` §3，不通过猜测补题。
 
 ## 快速开始
 
@@ -12,11 +42,12 @@
 # 环境（仓库根目录）
 uv sync --locked --package kotaemon --package ktem
 
-# 1. 从 test-materials/search-cases.md 生成数据集（幂等，可重复运行）
-.venv/Scripts/python.exe -m evaluation.scripts.convert_search_cases
+# 1. 结构校验（24 题、题型分布、字段规则、无答案题的检查范围）
+.venv/Scripts/python.exe -m evaluation.scripts.validate_dataset \
+    evaluation/datasets/qa_cases_v2.jsonl --min-cases 24
 
-# 2. 校验数据集结构
-.venv/Scripts/python.exe -m evaluation.scripts.validate_dataset evaluation/datasets/qa_cases.jsonl
+# 2. 引文复核：重新抽取 4 份文档，逐条断言引文出现在指定页/张/章节
+.venv/Scripts/python.exe -m evaluation.scripts.verify_evidence
 
 # 3. 跑检索指标（离线 fixture，不是实验结论）
 .venv/Scripts/python.exe -m evaluation.scripts.run_retrieval_eval \
@@ -30,11 +61,11 @@ uv sync --locked --package kotaemon --package ktem
     --citation-labels evaluation/tests/fixtures/citation_labels_stub.jsonl \
     --out evaluation/results/answer_fixture.json
 
-# 5. 单测（全部离线）
+# 5. 单测（全部离线；引文用例在文档缺失时自动跳过）
 .venv/Scripts/python.exe -m pytest evaluation -q
 ```
 
-> 上面第 3、4 步用的是 `tests/fixtures/*_stub.*`，**synthetic fixture，不是实验结果**，只用来证明"数据集 → 适配器 → 指标 → 报告"这条链路通。
+> 第 3、4 步用的是 `tests/fixtures/*_stub.*`，**synthetic fixture，不是实验结果**，只证明"数据集 → 适配器 → 指标 → 报告"链路通。
 
 ## 目录
 
@@ -43,35 +74,21 @@ evaluation/
 ├── README.md              本文件
 ├── DESIGN.md              接口检查结论、指标定义、实验矩阵、协作事项
 ├── datasets/
-│   ├── schema.md          JSONL 字段规范（含证据分组语义）
-│   ├── qa_cases.jsonl     已转换的 6 道 search-cases（原文片段待补）
-│   └── candidates.md      如何把 6 题扩充到 20+（只用真实资料）
-├── metrics/
-│   ├── retrieval.py       Hit@K / MRR@K / 证据组召回@K
-│   ├── answer.py          答案正确率（人工标签聚合）/ 拒答指标
-│   └── citation.py        引用有效性（自动）/ 引用支持度（人工标签）
-├── adapters/
-│   ├── base.py            RetrievalAdapter / AnswerAdapter 协议与数据形状
-│   ├── part_b.py          B 独立索引的适配器（子进程调用其 CLI）
-│   └── stub.py            fixture 适配器（离线链路验证）
+│   ├── schema.md          JSONL 字段规范（含证据分组、无答案题的检查范围）
+│   ├── qa_cases_v2.jsonl  ✅ 正式数据集：24 题
+│   ├── qa_cases.jsonl     ⚠️ 已废弃：原 6 道 search-cases，仅作历史对照
+│   └── candidates.md      v2 的选题依据与后续扩充方向
+├── metrics/               retrieval / answer / citation 指标（纯函数）
+├── adapters/              base 协议、part_b 适配器、fixture 适配器
 ├── scripts/
-│   ├── convert_search_cases.py
-│   ├── validate_dataset.py
+│   ├── convert_search_cases.py   v1 转换器（历史用途，仍可用）
+│   ├── validate_dataset.py       结构与规则校验
+│   ├── verify_evidence.py        引文逐字复核 + 无答案题缺失校验
 │   ├── run_retrieval_eval.py
 │   └── run_answer_eval.py
-├── tests/                 34 项离线单测 + fixtures
+├── tests/                 单测 + fixtures
 └── results/               运行产物（当前为空，报告需人工确认后再入库）
 ```
-
-## 与仓库现有资产的关系
-
-| 现有资产 | 关系 |
-|---|---|
-| `test-materials/search-cases.md` | **数据来源**，由 `convert_search_cases.py` 校验后转换；markdown 改动会让转换失败，防止静默漂移 |
-| `test-materials/ingestion-results.json` | A 的入库计数与 6 条锚点；本框架不复用它做指标，只在文档中引用 |
-| `scripts/part_b_*.py` | B 的检索实验脚本；本框架不 import、不修改，`PartBRetrievalAdapter` 通过 CLI 调用并解析其 JSON |
-| `kotaemon.indices.qa.utils` | C 的引用校验与拒答判定；`metrics/` **直接调用**，保证与产品行为一致 |
-| `libs/kotaemon/tests/test_qa_citation.py` | C 的 22 项单测；本框架不重复实现其逻辑，只做指标层封装 |
 
 ## 指标口径（详见 DESIGN.md §2）
 
@@ -79,7 +96,7 @@ evaluation/
 |---|---|---|
 | `Hit@K` | 有答案题中，Top-K 含**至少一个**正确证据的题目比例 | 全自动 |
 | `MRR@K` | 首个正确证据排名的倒数均值 | 全自动 |
-| `evidence_recall@K` | 已覆盖证据**组**数 / 总组数（双证据题看部分覆盖） | 全自动 |
+| `evidence_recall@K` | 已覆盖证据**组**数 / 总组数 | 全自动 |
 | `answer_accuracy` | 人工标签 `correct=1 / partial=0.5 / incorrect=0` 的均值 | 标签由人工给 |
 | `citation_validity_rate` | 非拒答回答中，全部 `【n】` 都能在本次证据里找到的比例 | 全自动（复用 C 的校验） |
 | `citation_support_rate` | 被引片段确实支持该句的比例 | 标签由人工给 |
@@ -87,11 +104,31 @@ evaluation/
 | `false_refusal_rate` | 有答案题中被误拒答的比例 | 全自动 |
 | `balanced_accuracy` | 上述两者的平衡值，防止"全部拒答"刷分 | 全自动 |
 
+## 证据与分块的关系
+
+`gold_evidence` 锚定 **文件 + 页码/幻灯片/章节**，不用 chunk ID。原因是 1024/256 与 512/128 两种分块会生成不同的 chunk id 和边界，用 chunk id 做判据会让对比失真。`chunk_id` 字段保留但默认为 `null`。
+
+多证据题用 `group` 表达语义：
+
+- 同组任选（例如"第 26 或 27 张任一命中"）；
+- 跨组必中（例如"选项卡"+"选项名"是两组，都必须命中）。
+
+## 与仓库现有资产的关系
+
+| 现有资产 | 关系 |
+|---|---|
+| `test-materials/download_samples.py` | 数据集来源与 SHA-256 校验；本框架不改动它 |
+| `test-materials/search-cases.md` | 仅用于生成**已废弃**的 v1，不再参与评测 |
+| `test-materials/ingestion-results.json` | A 的入库计数与锚点；本框架不做指标复用 |
+| `scripts/part_b_*.py` | B 的检索实验脚本；`PartBRetrievalAdapter` 通过 CLI 调用并解析 JSON，不改其代码 |
+| `kotaemon.indices.qa.utils` | C 的引用校验与拒答判定；`metrics/` **直接调用**，保证与产品行为一致 |
+
 ## 当前状态（真实进度）
 
-- 数据集：**6/20** 题，全部为 `answerable`；9 个证据单元、8 个证据组；**9 处原文片段待补**（`quote=null`）。
-- 无答案题：**0 条**，需要先确认"库中确实没有"再录入（见 `datasets/candidates.md`）。
-- 适配器：`fixture` 可用；`part-b` 已实现但**尚未对真实索引运行**（需要 B 的 `--index-dir` 与本地 `.env` 里的 DashScope key）。
+- 数据集：**24/24 题**已完成，题型分布 12/6/3/3，34 条引文全部通过逐字复核。
+- 文档覆盖：hash 讲义（PDF 26 条引文、PPTX 1 条）、USTC 6 条、USST 1 条。**UTS 两份文档 403 不可得**，因此没有使用。
+- 无答案题：3 条，均记录 `checked_scope`（检查文件、方法、可机器复核的缺失证据）。
+- 适配器：`fixture` 可用；`part-b` 已实现但**尚未对真实索引运行**（需要 B 的 `--index-dir` 与本地 `.env`）。
 - 真实实验：**一条都没有跑**，`results/` 为空是符合预期的。
 
 ## 约定

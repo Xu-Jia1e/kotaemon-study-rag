@@ -6,12 +6,17 @@ from pathlib import Path
 from evaluation.scripts import run_answer_eval, run_retrieval_eval
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# These smoke tests use the deprecated v1 dataset on purpose: the fixtures are
+# keyed to its sc-* ids, and v2's real evidence must not be mixed with stubs.
+V1_CASES = Path(__file__).resolve().parents[1] / "datasets" / "qa_cases.jsonl"
 
 
 def test_retrieval_eval_runs_end_to_end_with_fixture(tmp_path):
     out = tmp_path / "retrieval.json"
     code = run_retrieval_eval.main(
         [
+            "--cases",
+            str(V1_CASES),
             "--adapter",
             "fixture",
             "--stub-fixture",
@@ -38,6 +43,8 @@ def test_answer_eval_aggregates_predictions_and_labels(tmp_path):
     out = tmp_path / "answer.json"
     code = run_answer_eval.main(
         [
+            "--cases",
+            str(V1_CASES),
             "--predictions",
             str(FIXTURES / "predictions_stub.jsonl"),
             "--labels",

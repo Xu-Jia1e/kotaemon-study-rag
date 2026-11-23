@@ -21,7 +21,7 @@ from evaluation.metrics import (
 from evaluation.scripts.validate_dataset import load_cases
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CASES = REPO_ROOT / "evaluation" / "datasets" / "qa_cases.jsonl"
+DEFAULT_CASES = REPO_ROOT / "evaluation" / "datasets" / "qa_cases_v2.jsonl"
 DEFAULT_OUT = REPO_ROOT / "evaluation" / "results" / "answer_report.json"
 
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VALID_QUESTION_TYPES = {"answerable", "unanswerable", "partially_answerable"}
+VALID_CATEGORIES = {"direct", "synthesis", "detail", "unanswerable"}
 VALID_LOCATOR_KINDS = {"page", "slide", "section", "table_row"}
 REQUIRED_FIELDS = (
     "id",
@@ -25,7 +26,12 @@ REQUIRED_FIELDS = (
     "gold_evidence",
     "evidence_status",
 )
-VALID_EVIDENCE_STATUS = {"locator_only", "quote_verified", "pending"}
+VALID_EVIDENCE_STATUS = {
+    "locator_only",
+    "quote_verified",
+    "pending",
+    "not_applicable",
+}
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -42,6 +48,25 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
                 raise SystemExit(f"{path}:{line_number}: expected a JSON object")
             cases.append(record)
     return cases
+
+
+def _check_unanswerable_scope(case_id: str, case: dict[str, Any]) -> list[str]:
+    """An unanswerable case must show *how* absence was checked."""
+    errors: list[str] = []
+    scope = case.get("checked_scope")
+    if not isinstance(scope, dict):
+        return [f"{case_id}: unanswerable case requires a checked_scope object"]
+    if not scope.get("files"):
+        errors.append(f"{case_id}: checked_scope.files must list checked documents")
+    if not scope.get("method"):
+        errors.append(f"{case_id}: checked_scope.method must describe the check")
+    machine_checks = ("absent_phrases", "max_mentions", "blank_fields")
+    if not any(scope.get(key) for key in machine_checks):
+        errors.append(
+            f"{case_id}: checked_scope needs absent_phrases, max_mentions "
+            "or blank_fields"
+        )
+    return errors
 
 
 def validate_cases(cases: Iterable[dict[str, Any]]) -> tuple[list[str], list[str]]:
@@ -62,6 +87,13 @@ def validate_cases(cases: Iterable[dict[str, Any]]) -> tuple[list[str], list[str
         question_type = case.get("question_type")
         if question_type not in VALID_QUESTION_TYPES:
             errors.append(f"{case_id}: invalid question_type {question_type!r}")
+
+        category = case.get("category")
+        if category is not None and category not in VALID_CATEGORIES:
+            errors.append(f"{case_id}: invalid category {category!r}")
+
+        if question_type == "unanswerable":
+            errors.extend(_check_unanswerable_scope(case_id, case))
 
         if case.get("evidence_status") not in VALID_EVIDENCE_STATUS:
             errors.append(
@@ -104,6 +136,12 @@ def validate_cases(cases: Iterable[dict[str, Any]]) -> tuple[list[str], list[str
                 errors.append(f"{prefix}: quote_status=pending requires quote=null")
             if unit.get("quote_status") == "verified" and not quote:
                 errors.append(f"{prefix}: quote_status=verified requires a quote")
+            if case.get("evidence_status") == "quote_verified":
+                if unit.get("quote_status") != "verified" or not quote:
+                    errors.append(
+                        f"{prefix}: evidence_status=quote_verified requires a "
+                        "verified quote"
+                    )
 
     return errors, warnings
 
