@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from evaluation.metrics.answer import ANSWER_LABELS, is_refusal
-from evaluation.metrics.citation import validate_answer_citations
+from evaluation.metrics.citation import (
+    normalize_support_label,
+    validate_answer_citations,
+)
 from evaluation.metrics.retrieval import group_units, match_ranks
 
 CATEGORIES = ("direct", "synthesis", "detail", "unanswerable")
@@ -46,6 +49,9 @@ class CaseRecord:
     refusal_correct: bool | None = None
     expected_refusal: bool = False
     citation_support_supported: int = 0
+    citation_support_unsupported: int = 0
+    citation_support_uncertain: int = 0
+    citation_support_assessable: int = 0
     citation_support_total: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,18 +76,27 @@ def _recall_at_k(gold: Sequence[Mapping[str, Any]], items, k: int) -> float:
 
 def _citation_support(
     labels: Sequence[Mapping[str, Any]]
-) -> tuple[str | None, int, int]:
-    flags = [bool(label.get("supported")) for label in labels]
-    if not flags:
-        return None, 0, 0
-    supported = sum(1 for flag in flags if flag)
-    if supported == len(flags):
+) -> tuple[str | None, int, int, int]:
+    if not labels:
+        return None, 0, 0, 0
+    supported = unsupported = uncertain = 0
+    for label in labels:
+        category = normalize_support_label(label)
+        if category == "supported":
+            supported += 1
+        elif category == "unsupported":
+            unsupported += 1
+        else:
+            uncertain += 1
+    if supported and not unsupported and not uncertain:
         verdict = "supported"
-    elif supported == 0:
+    elif unsupported and not supported and not uncertain:
         verdict = "unsupported"
+    elif uncertain and not supported and not unsupported:
+        verdict = "uncertain"
     else:
         verdict = "mixed"
-    return verdict, supported, len(flags)
+    return verdict, supported, unsupported, uncertain
 
 
 def build_case_records(
@@ -125,7 +140,9 @@ def build_case_records(
                 validate_answer_citations(text, evidence_index).get("citation_valid")
             )
 
-        verdict, supported, total = _citation_support(citation_labels.get(case_id, []))
+        verdict, supported, unsupported, uncertain = _citation_support(
+            citation_labels.get(case_id, [])
+        )
 
         records.append(
             CaseRecord(
@@ -158,7 +175,10 @@ def build_case_records(
                 ),
                 expected_refusal=expected_refusal,
                 citation_support_supported=supported,
-                citation_support_total=total,
+                citation_support_unsupported=unsupported,
+                citation_support_uncertain=uncertain,
+                citation_support_assessable=supported + unsupported,
+                citation_support_total=supported + unsupported + uncertain,
             )
         )
     return records
@@ -192,7 +212,13 @@ def _subset_metrics(records: Sequence[CaseRecord]) -> dict[str, Any]:
 
     citations = [record for record in records if record.citation_valid is not None]
     supported = sum(record.citation_support_supported for record in records)
-    support_total = sum(record.citation_support_total for record in records)
+    unsupported = sum(record.citation_support_unsupported for record in records)
+    uncertain = sum(record.citation_support_uncertain for record in records)
+    assessable = supported + unsupported
+    total_citations = supported + unsupported + uncertain
+    citation_support_rate = (
+        round(supported / assessable, 6) if assessable else None
+    )
 
     unanswerable = [record for record in records if record.expected_refusal]
     answerable_refusals = [
@@ -237,10 +263,16 @@ def _subset_metrics(records: Sequence[CaseRecord]) -> dict[str, Any]:
             else None
         ),
         "cases_with_citation_check": len(citations),
-        "citation_support": (
-            round(supported / support_total, 6) if support_total else None
-        ),
-        "citations_labelled": support_total,
+        "citation_support": citation_support_rate,
+        "citation_support_rate": citation_support_rate,
+        "supported_count": supported,
+        "unsupported_count": unsupported,
+        "uncertain_count": uncertain,
+        "assessable_count": assessable,
+        "total_citations": total_citations,
+        "citation_support_total": total_citations,
+        "citation_support_assessable": assessable,
+        "citations_labelled": total_citations,
         "refusal_accuracy": refusal_accuracy,
         "false_refusal_rate": false_refusal_rate,
         "balanced_accuracy": balanced,

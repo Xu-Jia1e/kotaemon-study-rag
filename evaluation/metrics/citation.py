@@ -38,6 +38,32 @@ _ABSTAIN_PATTERNS = (
     "not provided in the context",
 )
 
+SUPPORT_LABELS = ("supported", "unsupported", "uncertain")
+
+
+def normalize_support_label(label: Mapping[str, Any]) -> str:
+    """Return the tri-state support label, accepting legacy booleans.
+
+    Booleans are kept only for old label files:
+    ``True -> supported`` and ``False -> unsupported``. Everything else must
+    be one of the three explicit strings; no truthiness coercion is allowed.
+    """
+    value = label.get("supported")
+    if value is True:
+        return "supported"
+    if value is False:
+        return "unsupported"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in SUPPORT_LABELS:
+            return normalized
+    case_id = label.get("case_id", "?")
+    citation_index = label.get("citation_index", "?")
+    raise ValueError(
+        f"invalid citation support label {value!r} for {case_id}#{citation_index}; "
+        "expected 'supported', 'unsupported', 'uncertain', or a legacy boolean"
+    )
+
 
 def _fallback_expand(group: str) -> list[int]:
     indices: list[int] = []
@@ -124,7 +150,13 @@ def evaluate_citations(
     """Aggregate citation validity (automatic) and support (labelled).
 
     ``predictions[case_id]`` must provide ``text`` and ``evidence_index``.
-    ``support_labels`` items: ``{"case_id", "citation_index", "supported": bool}``.
+    ``support_labels`` items:
+    ``{"case_id", "citation_index",
+    "supported": "supported"|"unsupported"|"uncertain"}``.
+    Legacy boolean labels (``True``/``False``) are accepted as supported/unsupported.
+    Uncertain labels are counted separately and excluded from the support rate
+    denominator. The rate is ``supported / (supported + unsupported)``; when
+    all labels are uncertain it is ``None``, not zero.
     """
     per_case: list[dict[str, Any]] = []
     scored = 0
@@ -165,17 +197,24 @@ def evaluate_citations(
             }
         )
 
-    supported = total_labels = 0
+    supported_count = unsupported_count = uncertain_count = 0
     unsupported_ids: list[str] = []
+    uncertain_ids: list[str] = []
+    total_labels = 0
     for label in support_labels:
         total_labels += 1
-        if label.get("supported") is True:
-            supported += 1
+        category = normalize_support_label(label)
+        label_id = f"{label.get('case_id')}#{label.get('citation_index')}"
+        if category == "supported":
+            supported_count += 1
+        elif category == "unsupported":
+            unsupported_count += 1
+            unsupported_ids.append(label_id)
         else:
-            unsupported_ids.append(
-                f"{label.get('case_id')}#{label.get('citation_index')}"
-            )
+            uncertain_count += 1
+            uncertain_ids.append(label_id)
 
+    assessable_count = supported_count + unsupported_count
     return {
         "cases_scored": scored,
         "answers_without_evidence": missing,
@@ -185,10 +224,19 @@ def evaluate_citations(
         "mean_citation_coverage": (
             round(sum(coverages) / len(coverages), 6) if coverages else None
         ),
+        "supported_count": supported_count,
+        "unsupported_count": unsupported_count,
+        "uncertain_count": uncertain_count,
+        "assessable_count": assessable_count,
+        "total_citations": total_labels,
         "citation_support_total": total_labels,
+        "citation_support_assessable": assessable_count,
         "citation_support_rate": (
-            round(supported / total_labels, 6) if total_labels else None
+            round(supported_count / assessable_count, 6)
+            if assessable_count
+            else None
         ),
         "unsupported_citations": unsupported_ids,
+        "uncertain_citations": uncertain_ids,
         "per_case": per_case,
     }

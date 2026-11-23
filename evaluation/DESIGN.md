@@ -227,8 +227,21 @@ Two distinct questions are measured separately:
 
 ```
 Citation Validity = valid non-abstained answers / scored non-abstained answers
-Citation Support  = supported citation labels / total citation labels
+Citation Support  = supported / (supported + unsupported)
 ```
+
+Citation Support uses three explicit human labels:
+
+- **supported** — counted in both the numerator and the denominator.
+- **unsupported** — counted only in the denominator.
+- **uncertain** — counted in neither the numerator nor the denominator; it is
+  reported separately as `uncertain_count`.
+
+If every citation is `uncertain`, `assessable_count` is zero and Citation
+Support is `null`, not zero. The report also surfaces `supported_count`,
+`unsupported_count`, `uncertain_count`, `assessable_count`, and
+`total_citations`. A citation label is not a citation-validity result:
+validity is automatic, while support is a human judgement.
 
 Abstentions are excluded from both denominators: an abstention has no citation
 by design, and counting it as "invalid" would punish correct refusal. Empty
