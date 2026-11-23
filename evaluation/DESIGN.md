@@ -1,254 +1,518 @@
-# 评测设计与接口检查（v1）
+# Evaluation Design and Experimental Analysis
 
-本文回答三件事：**现有代码的入口和字段是什么**、**指标怎么定义才公平**、**要跑完整实验还缺什么**。所有结论都来自静态阅读 + 离线单测，未运行任何真实模型调用。
+This document describes the technical design of the `evaluation/` module and
+analyses the real experiments completed for the study-material RAG project. It
+complements `README.md`: the README explains how to use the module, while this
+document explains why it is built this way and what the results mean.
 
-## 1. 接口检查结论
+The evaluation module is a consumer of the application libraries. It does not
+modify `libs/kotaemon/`, `libs/ktem/`, or `app.py`.
 
-### 1.1 检索链路（B）
+## 1. System Overview
 
-| 层 | 入口 | 关键点 |
+The project separates four concerns:
+
+| Concern | Implementation | Evaluation boundary |
 |---|---|---|
-| UI | `libs/ktem/ktem/pages/chat/__init__.py:1258` | 取选中文件，调用 `index.get_retriever_pipelines(...)` |
-| 索引层 | `libs/ktem/ktem/index/file/index.py:473` | `_selector_ui.get_selected_ids` 还原文件 ID |
-| pipeline | `libs/ktem/ktem/index/file/pipelines.py:115` | `run(text, doc_ids, ...) -> list[RetrievedDocument]` |
-| 检索 | `libs/kotaemon/kotaemon/indices/vectorindex.py:134` | `run(text, top_k, **kwargs)`，内部 `self.embedding(text)[0].embedding`（**问题向量化的唯一出口**） |
-| 结果字段 | `RetrievedDocument`（`base/schema.py:121`） | `text`、`metadata.file_name/page_label/section/type`、`score`、`doc_id` |
+| A. Parsing, chunking, index build | `IndexDocumentPipeline` in `libs/ktem` | `evaluation/adapters/a_index.py` builds and loads indexes |
+| B. Retrieval | `VectorRetrieval` in `libs/kotaemon` | `evaluation/adapters/b_a_index.py` connects it to an A index |
+| C. Grounded answer, citation, abstention | `PrepareEvidencePipeline`, `AnswerWithContextPipeline`, `CitationPipeline` | `evaluation/adapters/c_answer.py` |
+| D. Evaluation | `evaluation/` | Datasets, metrics, batch runners, reports |
 
-- 检索模式默认 `hybrid`（`pipelines.py:250-255`），但混合是"文本命中优先 + 向量候选，各自截断"，**没有分数融合**（`vectorindex.py:224-233`）。
-- RRF 只存在于 B 的脚本里（`scripts/part_b_retrieval.py:41`），库内没有。
-- 重排默认绑定 Cohere（`flowsettings.py:309`），但空 key 时**原样返回**（`rankings/cohere.py:41`）；而 `rerankers` 非空会把首轮候选从 `top_k` 放大到 `top_k*10`（`pipelines.py:156`）。**"关掉重排"和"候选深度"是耦合的**，做消融必须显式固定。
+The two real chunking configurations are evaluated on the same 30-question
+dataset and the same four source documents:
 
-### 1.2 回答与引用链路（C）
+- `1024/256`: 1024-token chunks with 256-token overlap.
+- `512/128`: 512-token chunks with 128-token overlap.
 
-| 能力 | 入口 | 字段 |
+Only the 1024/256 configuration has an end-to-end answer and human-grading run.
+The 512/128 configuration has a real retrieval run but no answer generation and
+no human grading.
+
+## 2. Evaluation Architecture
+
+```
+                    evaluation/datasets/qa_cases_v2.jsonl
+                                   │
+                                   ▼
+                  ┌─────────────────────────────────┐
+                  │ validate_dataset / verify_evidence │
+                  │ (schema + verbatim quote checks)  │
+                  └─────────────────────────────────┘
+
+  .eval-index/<profile>/                run_batch_retrieval.py
+  ├── index.json          ──────────►  ├── per_case.jsonl (append + fsync)
+  ├── vectors (Chroma)                 ├── retrieval.json
+  ├── documents (LanceDB)              ├── failures.json
+  └── pipeline.sqlite3                 ├── summary.json
+                                       └── run_manifest.json
+                                                │
+                                                ▼
+  retrieval.json ──────────────► run_batch_e2e.py ──────────► answers.json
+                                  (C answer + citation)       predictions.jsonl
+                                                              report_auto.json
+                                                              run_manifest.json
+                                                                      │
+                                                                      ▼
+  answers.json + human labels ──► run_answer_eval.py ─────────► report_scored.json
+  retrieval.json ───────────────► report_content_metrics.py ──► content_metrics.json
+```
+
+### Components
+
+| Component | Responsibility |
+|---|---|
+| `adapters/a_index.py` | Build and load A indexes; normalise D and A manifest schemas; select the correct Chroma collection and LanceDB table; reject empty collections; verify counts |
+| `adapters/b_a_index.py` | Wrap B's `VectorRetrieval` over the loaded A stores and return evaluator items |
+| `adapters/c_answer.py` | Prepare evidence, generate an answer, extract citations, validate citation markers, count real LLM calls |
+| `batch.py` | Shared resilient execution: per-case isolation, append-and-fsync, resume, retries, manifests, rebuilds |
+| `scripts/run_batch_retrieval.py` | 30-question retrieval runner with resume and rebuild |
+| `scripts/run_batch_e2e.py` | 30-question answer runner with resume, rebuild, and LLM call accounting |
+| `metrics/retrieval.py` | Strict Hit@K, MRR@K, grouped evidence Recall@K |
+| `metrics/content.py` | Supplementary content-level Hit@K and Recall@K from gold quotes |
+| `metrics/answer.py` | Answer correctness aggregation and refusal metrics |
+| `metrics/citation.py` | Citation validity and citation-support aggregation |
+| `reporting.py` | Per-case records, aggregate metrics, Markdown rendering |
+| `scripts/make_grading.py` | Human grading sheets with cited chunk text |
+| `scripts/report_content_metrics.py` | Strict-vs-content comparison and four-case evidence appendix |
+
+### Position of the experiment matrix
+
+`evaluation/matrix.py` defines a planning grid of 2 chunking configurations ×
+3 retrieval modes × 3 Top-K values = 18 cells. The grid is a planning scaffold,
+not the executed experiment set. The results reported here are the two
+vector/k=5 cells executed through the dedicated batch runners. Hybrid retrieval,
+RRF, other Top-K values, and reranking were not run.
+
+## 3. Dataset Design
+
+### Composition
+
+`evaluation/datasets/qa_cases_v2.jsonl` is the only official evaluation set:
+
+| Type | Count | Design intent |
+|---|---:|---|
+| `direct` | 12 | One evidence unit, answer stated explicitly |
+| `synthesis` | 8 | At least two evidence groups; cross-page or cross-section integration |
+| `detail` | 5 | Exact line, symbol, or table cell |
+| `unanswerable` | 5 | Knowledge base genuinely lacks the answer; must be refused |
+
+Totals: **30 questions, 25 answerable, 5 unanswerable, 43 evidence units/groups**.
+The dataset SHA-256 is recorded in the run manifests; the current value is
+`9c2c72ad79004f4b…`.
+
+### Evidence anchoring
+
+Every gold unit is anchored on:
+
+```json
+{"file": "11-hash2.pdf", "locator": {"kind": "page", "value": 23},
+ "group": "clustering", "quote": "..."}
+```
+
+`chunk_id` is intentionally not the anchor. The two chunking configurations
+produce different boundaries and ids for the same passage, so a chunk-id anchor
+would make the comparison invalid. `locator.kind` may be `page`, `slide`,
+`section`, or `table_row`.
+
+### Evidence groups
+
+- Units in the same `group` are interchangeable: "page 26 **or** page 27" is one
+  requirement.
+- Different groups must all be covered: a two-part question needs both groups.
+- Group coverage is what Strict Recall@K measures.
+
+### Unanswerable questions
+
+Each unanswerable case carries a `checked_scope` with machine-checkable
+constraints:
+
+- `absent_phrases`: phrases that would make the question answerable must be
+  absent from the corpus;
+- `max_mentions`: a term may appear only a bounded number of times (for example,
+  "cuckoo" appears once as a topic name only);
+- `blank_fields`: a template field exists but contains no digits/value.
+
+`verify_evidence.py` evaluates these constraints; a violation fails the check.
+
+### Source documents
+
+| File | SHA-256 (prefix) | Role |
 |---|---|---|
-| 证据编号 | `format_context.py:71-77` | `[n]` 前缀 + `evidence_index`（`index/doc_id/file_name/page_label/section/type`） |
-| 问答 | `citation_qa.py:205-259` | `run/invoke/stream(question, evidence, evidence_mode)` → `Document(text, metadata)` |
-| 引用状态 | `citation_qa.py:41-67` | `citation_status ∈ {ok, failed}`、`citation_validation`（8 键，见 `utils.py:36-59`） |
-| 拒答 | `utils.py:28`、`citation_qa.py:70` | `is_abstention(text)` 文本判定 + `ABSTAIN_MARKER` 固定句 |
-| UI 提示 | `libs/ktem/ktem/reasoning/simple.py:230-258` | 信息面板两条提示，**不改写答案文本** |
+| `11-hash2.pdf` | `7aa2d367…` | English hash-table lecture, 37 pages |
+| `11-hash2.pptx` | `8d92e93c…` | Same lecture, PPTX, 37 slides |
+| `USTC-ClassIn.pdf` | `ced8a509…` | Chinese ClassIn teaching guide, 16 pages |
+| `USST-syllabus.docx` | `09762a9c…` | Syllabus template with the bridge example row |
 
-**产品层没有结构化的拒答字段**（无 `abstained` 布尔值），拒答只能从文本判定——评测因此复用同一个 `is_abstention`，而不是另写一套。
+The two UTS accessibility documents return HTTP 403 from the source host and are
+not used. `qa_cases.jsonl` (6 legacy search cases) is retained only for
+historical reference and legacy smoke fixtures; it is not used in any reported
+metric.
 
-### 1.3 入库链路（A）
+## 4. Metric Definitions
 
-| 能力 | 入口 | 说明 |
+### 4.1 Strict retrieval metrics
+
+For the answerable set `A` (|A| = 25), with `Gold(q)` the set of gold units and
+`TopK(q)` the first K retrieved items:
+
+```
+Strict Hit@K      = |{q ∈ A : TopK(q) contains ≥1 gold unit}| / |A|
+MRR@K             = (1/|A|) Σ_q 1/rank_q(first matching unit)   (0 if none)
+Strict Recall@K   = (1/|A|) Σ_q covered_groups(q) / total_groups(q)
+```
+
+Matching rules:
+
+- file names are compared case-insensitively and by basename;
+- page and slide values are normalised to integers (`"p. 23"` → `23`);
+- section/table-row values are whitespace-normalised and case-folded;
+- `page`/`page_label`, `slide`/`slide_label`, and `section`/`table_row`/`heading`
+  are grouped as equivalent locator families;
+- a chunk-id fast path is used only when both gold and prediction carry one;
+- unanswerable questions are excluded by definition; only answerable questions
+  without gold evidence are counted in `cases_skipped` and listed in
+  `skipped_ids`, not silently counted as zero.
+
+### 4.2 Content-level metrics (supplementary)
+
+Strict matching has two known blind spots:
+
+1. the same lecture exists as PDF and PPTX, so an exact-content hit in the other
+   carrier is a strict miss;
+2. DOCX chunks carry no page or section metadata, so a `table_row` gold locator
+   cannot match positionally.
+
+The content metric checks the verified gold quote against the retrieved chunk
+text after whitespace and case normalisation:
+
+```
+Content Hit@K    = |{q : ≥1 gold quote appears in TopK(q) text}| / |A|
+Content Recall@K = (1/|A|) Σ_q matched_quotes(q) / total_quotes(q)
+```
+
+This is a diagnostic view only. It does not replace Strict Hit@K, MRR@K, or
+Strict Recall@K. In particular, Content Hit@5 = 1.0 means only that at least one
+quote was found per question; it does not mean group coverage or ranking is
+perfect.
+
+### 4.3 Answer correctness
+
+Human three-way labels:
+
+```
+correct    = 1.0
+partial    = 0.5
+incorrect  = 0.0
+not_judged = excluded
+```
+
+```
+Answer Accuracy  = Σ score / judged_count
+Strict Accuracy  = count(correct) / judged_count
+```
+
+Only the 25 answerable questions are judged. The five unanswerable questions are
+evaluated by refusal behaviour, not by answer accuracy. Unlabelled answers are
+`null` in automatic reports and are never converted to zero.
+
+### 4.4 Citation metrics
+
+Two distinct questions are measured separately:
+
+| Metric | Question | Method |
 |---|---|---|
-| 解析 + 分块 | `libs/ktem/ktem/index/file/pipelines.py:764-789` | `chunk_size or 1024`、`chunk_overlap or 256`；每个索引可用 `chunk_size/chunk_overlap` 覆盖（`index.py:419-437`） |
-| 建库 | `VectorIndexing.run`（`vectorindex.py:95`）→ Chroma / LanceDB / SQLite | 片段保留 `doc_id` + `page_label/section/type` |
-| 来源版本 | `test-materials/download_samples.py` | 6 份资料的 SHA-256 |
-
-**缺口**：没有独立的建库脚本，也没有第二套 512/128 索引；`ingestion-results.json` 未记录分块参数。
-
-## 2. 指标定义
-
-### 2.1 Hit@K
-
-对**有答案**题集 `A`：
+| Citation Validity | Does every `【n】` point to an evidence block retrieved for this question? | automatic, reuses C's `validate_citations` |
+| Citation Support | Does the cited passage support the sentence? | human label per citation |
 
 ```
-Hit@K = |{q ∈ A : Top-K(q) ∩ Gold(q) ≠ ∅}| / |A|
+Citation Validity = valid non-abstained answers / scored non-abstained answers
+Citation Support  = supported citation labels / total citation labels
 ```
 
-- 只统计 `question_type == answerable`；无答案题跳过（否则会把"检索不到"当成命中）。
-- `Gold(q)` 是按 `file + locator` 匹配的证据单元，**不是 chunk id**。
-- 分母不含缺证据的题（会被记入 `skipped_ids`，避免静默放水）。
+Abstentions are excluded from both denominators: an abstention has no citation
+by design, and counting it as "invalid" would punish correct refusal. Empty
+evidence is also excluded as undefined, not zero.
 
-### 2.2 MRR@K
-
-```
-MRR@K = (1/|A|) · Σ_q 1/rank_q(首个命中)      未命中记 0
-```
-
-### 2.3 证据组召回@K（本框架对"双证据题"的补充）
-
-`sc-02`（偏移 + 保证）、`sc-05`（选项卡 + 选项名）这类题，命中一半不该算全对：
+### 4.5 Refusal metrics
 
 ```
-recall@K = 已覆盖组数 / 总组数
+Refusal Accuracy  = refused unanswerable / 5
+False Refusal     = refused answerable / 25
+Balanced Accuracy = (Refusal Accuracy + 1 - False Refusal) / 2
 ```
 
-组语义：**同组内任一条命中即算覆盖**（"第 26 或 27 张"），**不同组必须各自命中**。
+Refusal is detected with the project's `is_abstention` implementation, so the
+metric matches shipped behaviour. The detector is text-based; the automatic
+values are a first pass, and the five unanswerable cases were also reviewed in
+the grading sheet.
 
-### 2.4 Answer Correctness
+### 4.6 Reporting rules
 
-人工三档：`correct=1.0`、`partial=0.5`、`incorrect=0.0`；`not_judged` 不计入分母。
+- Metrics without labels are `null`, never zero.
+- `report_auto.json` records automatic metrics only; human fields stay `null`.
+- `report_scored.json` records human-labelled metrics and includes the SHA-256
+  of `labels.jsonl`, the SHA-256 of `citation_labels.jsonl`, and
+  `grading_version`.
+- Per-case records distinguish `real`, `simulated`, `failed`, `missing`,
+  `unscored`, and `not applicable` states.
 
-```
-accuracy       = Σ score / 已判题数      （部分正确给 0.5）
-strict_accuracy = 判为 correct / 已判题数  （严格口径，两者都报）
-```
+## 5. Experimental Configuration
 
-脚本**不做语义判断**；无标签就是 `None`，不会用 0 或 1 填充。
+### 5.1 Common controls
 
-### 2.5 Citation Correctness
+| Control | Value |
+|---|---|
+| Dataset | `evaluation/datasets/qa_cases_v2.jsonl`, SHA-256 `9c2c72ad…` |
+| Questions | 30 (25 answerable, 5 unanswerable) |
+| Source documents | The same four files in both configurations |
+| Embedding | `text-embedding-v4`, 2048 dimensions, DashScope-compatible endpoint |
+| Retrieval | Vector only, Top-K = 5 |
+| Reranker | Disabled (`rerankers=[]`) |
+| Chunking A | 1024 tokens / 256 overlap |
+| Chunking B | 512 tokens / 128 overlap |
+| LLM (answers) | DeepSeek `deepseek-flash`, 1024/256 only |
 
-分两层，必须分开报告：
+The two indexes are built in separate processes because `theflow` caches its
+settings module. The 1024/256 index was built with
+`evaluation.adapters.a_index`; the 512/128 index was built with A's
+`scripts/part_a_index.py` and then loaded through the D adapter. Both are real
+indexes, not simulated fixtures.
 
-| 层 | 定义 | 判定方式 |
-|---|---|---|
-| 有效性 | 回答里所有 `【n】` 都落在本次 `evidence_index` 内 | 自动，调用 `kotaemon.indices.qa.utils.validate_citations` |
-| 支持度 | 被引片段确实支持该句 | 人工逐条标注 `supported: true/false` |
+### 5.2 Index statistics
 
-```
-citation_validity_rate = 有效回答数 / 参与评分的回答数
-citation_support_rate  = 被支持引用数 / 被标注引用总数
-```
+| Metric | 1024/256 | 512/128 |
+|---|---:|---:|
+| Text chunks | 106 | 111 |
+| Text vectors | 106 | 111 |
+| Docstore rows (including thumbnails) | 159 | 164 |
+| Page thumbnails (not embedded) | 53 | 53 |
+| Text chunks with a vector | 106/106 | 111/111 |
+| Source records | 4 | 4 |
+| Manifest schema | D (nested `embedding`) | A (flat fields + `collection`) |
+| Chroma collection | `default` | `index_1` |
+| LanceDB table | `docstore` | `index_1` |
 
-**口径决策**：拒答样本不计入引用指标。原因是当前 `validate_citations` 在"无任何引用标记"时直接置 `citation_valid=False`（`utils.py:137-140`），纯拒答会被误判成"引用无效"（已知缺陷，见 §4）。若不剔除，正确拒答会被扣分。
+Per-document text vectors:
 
-### 2.6 Refusal Accuracy
+| File | 1024/256 | 512/128 |
+|---|---:|---:|
+| `11-hash2.pdf` | 37 | 37 |
+| `11-hash2.pptx` | 37 | 37 |
+| `USTC-ClassIn.pdf` | 17 | 22 |
+| `USST-syllabus.docx` | 15 | 15 |
 
-双向报告，避免"全拒答"或"全作答"刷单一指标：
+The 512/128 delta is concentrated in `USTC-ClassIn.pdf`, whose page-level content
+splits into more text chunks.
 
-```
-refusal_accuracy   = 无答案题中拒答数 / 无答案题总数      （越高越好）
-false_refusal_rate = 有答案题中拒答数 / 有答案题总数      （越低越好）
-balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
-```
+### 5.3 Run status
 
-拒答判定复用 C 的 `is_abstention`（`utils.py:28`）。注意它也是"文本包含匹配"，`"don't know"` 一类可能被正文误触发——所以 `refusal_accuracy` 只能作为**自动初筛**，最终拒答结论仍需人工抽样复核。
+| Run | Status |
+|---|---|
+| 1024/256 retrieval, 30 questions | 30/30 success, 0 failed, 0 missing |
+| 512/128 retrieval, 30 questions | 30/30 success, 0 failed, 0 missing |
+| 1024/256 answers, 30 questions | 30/30 success; 60 real LLM calls (30 answers + 30 citation extractions) |
+| 512/128 answers | **not run** |
+| Human grading | 25 answerable answers and 51 citations; 5 refusal cases reviewed |
 
-## 3. 数据格式
+## 6. Experimental Results
 
-见 `datasets/schema.md`。要点：
+### 6.1 Retrieval
 
-- 证据锚定 `file + locator(kind, value)`；答案类题目要求 `quote` 逐字可复核（`evidence_status=quote_verified`）。
-- 支持证据组：同组可选、跨组必中，用于双证据/多问句题。
-- 无答案题必须带 `checked_scope`（检查了哪些文件、用什么方法、可机器复核的缺失证据）。
+| Metric | 1024/256 | 512/128 | Δ |
+|---|---:|---:|---:|
+| Strict Hit@5 | 0.8400 | 0.8400 | 0.0000 |
+| MRR@5 | 0.5833 | 0.5633 | −0.0200 |
+| Strict Recall@5 | 0.7560 | 0.7560 | 0.0000 |
+| Content Hit@5 | 1.0000 | 1.0000 | 0.0000 |
+| Content Recall@5 | 0.9107 | 0.8973 | −0.0133 |
 
-**正式数据集 `qa_cases_v2.jsonl`：30 题**，分布 `direct 12 / synthesis 8 / detail 5 / unanswerable 5`，共 43 条证据引文。
+By question type:
 
-数据来源是 4 份校验过 SHA-256 的真实文档：`11-hash2.pdf`（37 页）、`11-hash2.pptx`（37 张）、`USTC-ClassIn.pdf`（16 页）、`USST-syllabus.docx`（模板）。
+| Type | n | 1024 Hit | 512 Hit | 1024 MRR | 512 MRR | 1024 Recall | 512 Recall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| direct | 12 | 0.8333 | 0.8333 | 0.6458 | 0.6458 | 0.8333 | 0.8333 |
+| synthesis | 8 | 0.8750 | 0.8750 | 0.6250 | 0.5625 | 0.6125 | 0.6125 |
+| detail | 5 | 0.8000 | 0.8000 | 0.3667 | 0.3667 | 0.8000 | 0.8000 |
+| unanswerable | 5 | — | — | — | — | — | — |
 
-选题约束（避免"看起来合理但没依据"的题）：
+All of the aggregate difference is in synthesis MRR; Hit and Recall are
+unchanged.
 
-1. 只使用 **文本层可提取** 的内容。PDF 里的公式排版、槽位示意表在文本层是乱序的，凡无法逐字核对的片段一律不出题。
-2. `USST-syllabus.docx` 是空白模板，只有"桥梁工程的基本知识（示例）"一行有真实内容，因此从该行出教学重点/难点/预期成果、学生任务与思政资源题，另出一道无答案题（学分/学时字段为空）。
-3. `unanswerable` 题必须能机器验证"缺失"：`absent_phrases` 在全库无命中、`max_mentions` 限制提及次数（如 cuckoo 仅出现 1 次且只有名称）、或 `blank_fields` 断言字段行不含数字。
+### 6.2 Analysis of `v2-s06`
 
-复核命令：
+`v2-s06` asks for the three stages of USTC's online-teaching flow, the steps to
+create and enter a ClassIn classroom, and the screen-sharing entry point.
 
-> 下面输出是 **24 题旧版**的历史记录；当前正式数据集为 30 题（25 道有答案 / 5 道无答案），
-> 请以实际运行 `verify_evidence` 的输出为准。
+Gold evidence:
 
-```sh
-.venv/Scripts/python.exe -m evaluation.scripts.verify_evidence
-# -> 24 cases, 34 evidence quotes, 4 documents loaded, 0 error(s)
-```
+- page 2: "登录瀚海教学网";
+- page 4: "点击新建 ClassIn 课堂";
+- page 10: "选择共享工具".
 
-`datasets/qa_cases.jsonl`（原 6 道 search-cases）已废弃，仅作历史对照。
+With 1024/256, the page-4 chunk contains the full set of steps and ranks first.
+With 512/128, page 4 is split into several chunks; the chunk containing the gold
+sentence falls outside the Top-5. Another page-4 chunk ranks second, so strict
+matching by page still finds page 4 at rank 2, but the first match is no longer
+rank 1:
 
-## 4. 已知风险与设计决策
+- reciprocal rank: 1.0 → 0.5;
+- content recall: 3/3 → 2/3.
 
-| 风险 | 证据 | 对评测的影响 | 处理 |
-|---|---|---|---|
-| 纯拒答被判 `citation_valid=False` | `utils.py:137-140` + PR #3 的 `short-circuit abstention` 提交 | 引用有效率被拒答样本拉低 | 拒答样本不计入引用指标；报告注明基线 commit |
-| `citation_status=failed` 依赖 5s 超时 | `citation_qa.py:35,345` | 引用状态可能偶发抖动 | 多次运行取多数，或只统计 `citation_validation` |
-| 关掉引用样式仍会误报"引用未校验" | `simple.py:425-427` + `413-415` | 若做"无引用"配置，指标失真 | 实验矩阵固定 `highlight_citation=on` |
-| B 的索引不是 A 的主库，且只支持 PDF | `docs/part-b-retrieval.md:3` | 无法直接比较 PPTX/DOCX 题目 | 适配器接口先就位；`part-b` 路径标注"实验性" |
-| 重排未启用，且候选深度耦合 | `pipelines.py:156`、`cohere.py:41` | "有无重排"不是干净消融 | 显式固定 `rerankers=[]` 与 `use_reranking`，作为配置因子记录 |
-| 混合检索无融合 | `vectorindex.py:224-233` | 混合分数不可比 | 只比较排名类指标，不比较分数 |
+This explains the complete MRR drop and the content-recall drop. The other 24
+scored questions keep their first-match ranks. It is a chunk-boundary effect, not
+a general degradation of the 512/128 retriever.
 
-## 5. 实验矩阵（待 A 提供两套索引后执行）
+### 6.3 Answer and citation results (1024/256 only)
 
-| 因子 | 取值 | 说明 |
-|---|---|---|
-| 分块 | 1024/256、512/128 | A 的两套独立索引（512/128 为必做项，不是可选） |
-| 检索模式 | vector、hybrid、rrf | rrf 目前只在 B 的脚本里 |
-| Top-K | 5、7、20 | 5 为主口径，7/20 用于观察证据覆盖变化 |
-| 重排 | off | 当前无可用 reranker，不纳入主表 |
+| Metric | Value |
+|---|---:|
+| Answer Accuracy | **0.9400** (22 correct, 3 partial, 0 incorrect; 25 judged) |
+| Strict Accuracy | **0.8800** |
+| Citation Validity | **1.0000** (0 invalid ids) |
+| Citation Support | **0.9608** (49/51 citations) |
+| Refusal Accuracy | **1.0000** (5/5) |
+| False Refusal Rate | **0.0000** |
+| Balanced Accuracy | **1.0000** |
 
-每个组合报告：`Hit@K`、`MRR@K`、`evidence_recall@K`、`answer_accuracy`、`citation_validity_rate`、`citation_support_rate`、`refusal_accuracy`、`false_refusal_rate`。
+The three partial answers:
 
-## 6. 需要 A / B / C 配合的事项
+- `v2-s01`: linear probing's `+1` probing and primary clustering were omitted;
+- `v2-s04`: the role of the prime table size was not explained, and the answer
+  incorrectly claimed the material did not explain it;
+- `v2-s07`: independent chat/question areas and like/pin behaviour were omitted.
 
-| 对象 | 事项 | 原因 |
-|---|---|---|
-| A | 两套独立索引（1024/256、512/128）+ 分块参数说明 + 可重复建库脚本 | 跨分块对比的前置条件；当前只有一套结果且未记录参数 |
-| A | 在 `ingestion-results.json` 里补 `chunk_size/chunk_overlap` | 否则实验报告无法说明"数字对应哪套参数" |
-| B | 把 `part_b_retrieval.py query` 的索引换成/兼容 A 的主库，或提供 A 库的查询入口 | 现在 B 只查自建 PDF 索引，题目要求"从 A 建好的库检索" |
-| B | 支持 PPTX/DOCX 的独立索引，或确认评测只用 PDF 题 | 否则 6 题里 4 题无法用 part-b 路径 |
-| C | 确认拒答判定的权威口径（文本匹配 vs 结构化字段） | 决定 `refusal_accuracy` 是否可信 |
-| C | 提供一次真实 pipeline 的输出 JSONL（`case_id/text/evidence_index`） | 评测脚本只吃录制结果，不直接调 DeepSeek |
-| 全体 | 确认评测基线 commit（`2bed52f` 还是 PR #3 合并后） | C 的拒答/引用缺陷正在 PR #3 修 |
+Citation support: 49 of 51 citations were supported. In `v2-s04`, citations
+【2】【3】 support "use a prime table size" but not the claim "the material does not
+explain why". This is why Citation Validity = 1.0 but Citation Support = 0.9608:
+valid marker indices do not guarantee supporting content.
 
-## 7. 本阶段交付物
+All five unanswerable questions returned the fixed abstention sentence even
+though each had five retrieved evidence entries. This is a model-led refusal,
+not an empty-evidence short circuit.
 
-| 交付物 | 位置 | 状态 |
-|---|---|---|
-| 统一数据格式 | `evaluation/datasets/schema.md` | ✅ |
-| 30 题正式数据集 | `evaluation/datasets/qa_cases_v2.jsonl` | ✅ 12/8/5/5，43 条引文逐字复核 |
-| 引文复核工具 | `evaluation/scripts/verify_evidence.py` | ✅ 0 error |
-| 指标实现 | `evaluation/metrics/*.py` | ✅ |
-| 离线单测 | `evaluation/tests/` | ✅ 全绿 |
-| 检索适配器接口 | `evaluation/adapters/base.py`、`part_b.py` | ✅（fixture 已验证，part-b 未对真实索引运行） |
-| 实验矩阵 | `evaluation/matrix.py` | ✅ 18 组，全部显式 blocked |
-| 结果记录与报告 | `evaluation/reporting.py` | ✅ 12 字段/题 + 分题型统计 |
-| Simulated 链路验证 | `evaluation/scripts/run_experiment.py` | ✅ 带 SIMULATED 标记 |
-| 真实实验结果 | — | ❌ 未运行，符合本阶段约束 |
+### 6.4 Interpretation
 
-## 8. 实验矩阵与阻塞状态
+Within this dataset:
 
-### 8.1 矩阵定义
+- 512/128 does not improve Strict Hit@5 or Strict Recall@5;
+- 512/128 has a small MRR regression, fully attributable to `v2-s06`;
+- content coverage is slightly lower for the same reason;
+- 1024/256 has verified answer quality; 512/128 does not, because no answer run
+  was performed.
 
-| 维度 | 取值 | 数量 |
-|---|---|---:|
-| Chunking | `1024-256`、`512-128` | 2 |
-| Retrieval | `vector`、`hybrid`、`rrf` | 3 |
-| Top-K | `3`、`5`、`10` | 3 |
-| Reranking | `off`（默认）；`on` 为可选 | 1 / 1 |
+The results do not justify switching the default chunking configuration to
+512/128. They also do not show that 512/128 is materially worse overall: apart
+from one synthesis question, ranking behaviour is identical.
 
-主矩阵 = 2 × 3 × 3 = **18 组**，全部使用**同一份** `datasets/qa_cases_v2.jsonl`（30 题）。报告里记录该文件 SHA-256，避免"换了数据集却说同一组实验"。
+## 7. Implementation Details
 
-Reranking 不进入主矩阵：`on` 状态是 **blocked**（Cohere key 为空时重排原样返回；qwen3-rerank 未接入），所以不存在"已实现重排"的实验。
+### 7.1 Index adapter compatibility
 
-### 8.2 各维度状态
+The adapter supports two manifest schemas:
 
-| 维度取值 | 状态 | 原因 | 依据 |
-|---|---|---|---|
-| chunking `1024-256` | blocked | 本机没有 A 的主库索引；Part B 自建索引是**按页**抽文本，不是 1024/256 token 分块 | `docs/part-b-retrieval.md`、`libs/ktem/ktem/index/file/pipelines.py:788` |
-| chunking `512-128` | blocked | A 未提供第二套索引，也没有可复现的分块参数记录 | 本文件 §6 |
-| retrieval `vector` | blocked | 需要索引 + `DASHSCOPE_API_KEY`；本阶段不调真实 API | `scripts/part_b_retrieval.py:134` |
-| retrieval `hybrid` | blocked | 同上；且混合检索无分数融合，只能比排名类指标 | `vectorindex.py:224` |
-| retrieval `rrf` | blocked | RRF 只在 B 的脚本里，仍需索引与 key | `scripts/part_b_retrieval.py:41` |
-| reranking `off` | ready | 不使用重排；需把候选深度固定为 `top_k`，避免 `do_extend` 隐式放大 | `pipelines.py:156` |
-| reranking `on` | blocked | 无可用 reranker | `rankings/cohere.py:41` |
+- **D schema**: nested `embedding.model/dimensions`, `files` as a list,
+  `vector_count`, `indexed_documents`.
+- **A schema**: flat `embedding_model`/`dimensions`, `files` as a mapping of
+  `source_id`/`error`, `collection`, `complete`.
 
-结果：**18 组全部 blocked，0 ready**。`run_experiment --matrix` 只输出状态，不产出任何指标。
+`normalize_manifest()` produces one canonical view for both. The loader:
 
-### 8.3 每道题的结果记录
+- reads the Chroma collection name from the manifest and opens that exact
+  collection (falling back to `default`/`docstore` only for the D schema);
+- checks collection existence with a read-only SQLite query **before** opening
+  Chroma, so a missing collection cannot be silently created;
+- rejects empty Chroma or LanceDB stores;
+- verifies the vector count against the manifest when one is recorded;
+- reports document-count differences (the 1024 manifest records 158 while the
+  store has 159 rows including thumbnails) as a warning rather than hiding it;
+- loads read-only: it does not create ORM tables in an existing index.
 
-`per_case.jsonl` 每条 = 一道题 × 一个实验组，字段：
+### 7.2 Resilient batch execution
 
-`case_id`、`category`、`chunking_strategy`、`retrieval_method`、`top_k`、`reranking`、`simulated`、`retrieved_evidence`、`hit_at_k`、`reciprocal_rank`、`recall_at_k`、`generated_answer`、`answer_correct`、`citation_valid`、`citation_supported`、`refusal_correct`、`expected_refusal`、`citation_support_supported`、`citation_support_total`。
+`batch.py` and the two batch runners implement:
 
-- `citation_valid`：编号存在性（自动，复用 C 的 `validate_citations`）；
-- `citation_supported`：`supported` / `unsupported` / `mixed`，来自人工逐条标注；
-- 二者**分开存储、分开统计**，编号合法不代表内容支持。
+- **Per-question isolation**: one exception produces one `failed` record; the
+  batch continues.
+- **Append and fsync**: every finished question is appended to
+  `per_case.jsonl` and flushed/fsynced, so a crash keeps completed work.
+- **Resume**: `--resume` skips only successful, complete records whose
+  configuration fingerprint matches the current dataset, index, model, Top-K,
+  chunking, and adapter version. Failed records are retried.
+- **Bounded retries**: transient 429/5xx/timeout errors are retried a limited
+  number of times with exponential backoff; other errors fail immediately.
+- **Run manifest**: git commit, code hashes, dataset/index/retrieval hashes,
+  model and chunking configuration, Top-K, timestamps, and counts. No API keys
+  are written.
+- **Rebuild**: `--rebuild-only` reconstructs outputs from `per_case.jsonl`
+  without calling a model.
+- **Interrupted state**: an interrupted run writes `status: interrupted` and
+  keeps the partial outputs built from completed records.
 
-### 8.4 报告统计
+### 7.3 Result integrity
 
-支持 7 项：`Hit@K`、`MRR`、`Recall@K`、`Answer Correctness`、`Citation Validity`、`Citation Support`、`Refusal Accuracy`，并额外给出 `false_refusal_rate`、`balanced_accuracy`。
+- A question cannot be silently counted as both success and failure; rebuilds
+  use the latest record per case.
+- `failures.json` separates failed questions from questions never run.
+- Unscored metrics stay `null`; `report_auto.json` records
+  `scored: 0, unscored: 30` for the answer run before human labels exist.
+- `text_chunks == text_vectors` is checked per index; the 53 PDF thumbnails are
+  deliberately excluded from the vector count.
+- The 1024/256 and 512/128 runs write to separate output directories; the
+  4-question pilot artifacts are not overwritten.
+- Human labels and the scored report are separate files; the scored report
+  records the label file hashes and `grading_version`.
 
-每种指标同时给出**总体**与**分题型**（direct / synthesis / detail / unanswerable）。无样本或无标签时输出 `—`（`null`），不按 0 计算。
+### 7.4 Tests
 
-### 8.5 Simulated 政策
+`evaluation/tests/` contains 95 tests covering:
 
-`synthetic fixture` 只用于验证"矩阵 → 记录 → 报告"链路：
+- dataset schema and 30-case distribution;
+- verbatim evidence verification;
+- strict and content retrieval metrics;
+- answer, citation, and refusal metrics;
+- manifest compatibility, collection selection, and empty-collection rejection;
+- batch isolation, retries, resume, interrupted runs, and rebuilds;
+- grading-sheet generation and overwrite protection;
+- report rendering and null handling.
 
-- 生成器 `make_simulated_fixture.py` 的每个输出都带 `"simulated": true`；
-- 报告顶部有 `SIMULATED — synthetic fixture, NOT experimental results` 横幅；
-- 报告配置里的 chunking / retrieval 写成 `SIMULATED-*`，不可能被误读成真实配置；
-- `run_experiment` 拒绝加载未标记 `simulated` 的 fixture。
+The tests are offline: they use fixtures or local files and do not call
+embedding or chat APIs. `pytest evaluation -q` passes 95 tests.
 
-`evaluation/results/` 里**没有**任何真实或模拟结果入库；验证产物写到仓库外。
+## 8. Limitations and Future Improvements
 
-### 8.6 当前结论（明确声明）
+### Limitations
 
-1. 正式测试集是 `datasets/qa_cases_v2.jsonl`，**30 题**（12 直接 / 8 综合 / 5 细节 / 5 无答案）。
-2. 数据来源只有 **4 份可读取文档**：`11-hash2.pdf`、`11-hash2.pptx`、`USTC-ClassIn.pdf`、`USST-syllabus.docx`。
-3. `UTS-accessible-word.docx` 与 `UTS-accessible-powerpoint.pptx` 因源站 **HTTP 403 未纳入**。
-4. **尚未完成任何真实检索或问答实验**：18 组实验全部 blocked，`results/` 为空。
-5. 本地代码基线为 `2bed52f`（加上 D 自己的 evaluation 提交），**尚未包含 PR #3**；因此 C 的"纯拒答被判 citation_valid=False"等缺陷仍存在，引用指标必须剔除拒答样本（已实现）。
+- **No reranker experiments.** Retrieval uses `rerankers=[]`; no reranking
+  result is claimed.
+- **Only vector retrieval at K = 5.** Hybrid retrieval, RRF, and K = 3/10 were
+  not run.
+- **512/128 is retrieval-only.** No answers, no citation labels, no refusal
+  review, and therefore no answer-quality claim for 512/128.
+- **Small, single-domain dataset.** 30 questions and four documents; the result
+  is descriptive, not a general benchmark.
+- **Single grader.** Human labels were produced by one evaluator; no
+  inter-annotator agreement or significance testing.
+- **Strict matching blind spots.** PDF/PPTX duplicates and DOCX chunks without
+  page/section metadata can create strict misses; content metrics mitigate but
+  do not replace strict metrics.
+- **Local-only artifacts.** Indexes and experiment outputs are gitignored; they
+  must be rebuilt or distributed separately.
+- **Different index builders.** 1024/256 was built by the D adapter; 512/128 was
+  built with A's script. Both are real and verified, but A's six-document counts
+  are not directly comparable with this four-document experiment.
 
+### Future improvements
+
+1. Enable and evaluate a reranker as a separate factor, with candidate depth
+   fixed.
+2. Run hybrid/RRF retrieval and K = 3/10 to test whether the chunking conclusion
+   holds beyond vector/K=5.
+3. Generate and grade 512/128 answers with the same rubric, so the two
+   configurations can be compared end to end.
+4. Add a second grader and report agreement.
+5. Extend the dataset and document set beyond the current course/tool domain.
+6. Improve DOCX chunk locators (or add a content-anchored matching mode) to
+   reduce known strict false misses.
+7. Publish index artifacts or a reproducible build recipe alongside the code if
+   external reproduction is required.
