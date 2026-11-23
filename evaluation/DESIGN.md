@@ -129,6 +129,9 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 
 复核命令：
 
+> 下面输出是 **24 题旧版**的历史记录；当前正式数据集为 30 题（25 道有答案 / 5 道无答案），
+> 请以实际运行 `verify_evidence` 的输出为准。
+
 ```sh
 .venv/Scripts/python.exe -m evaluation.scripts.verify_evidence
 # -> 24 cases, 34 evidence quotes, 4 documents loaded, 0 error(s)

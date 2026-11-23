@@ -44,7 +44,7 @@ uv sync --locked --package kotaemon --package ktem
 
 # 1. 结构校验（30 题、题型分布、字段规则、无答案题的检查范围）
 .venv/Scripts/python.exe -m evaluation.scripts.validate_dataset \
-    evaluation/datasets/qa_cases_v2.jsonl --min-cases 24
+    evaluation/datasets/qa_cases_v2.jsonl --min-cases 30
 
 # 2. 引文复核：重新抽取 4 份文档，逐条断言引文出现在指定页/张/章节
 .venv/Scripts/python.exe -m evaluation.scripts.verify_evidence

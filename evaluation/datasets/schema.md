@@ -83,7 +83,7 @@
 ```sh
 # 结构校验（字段、题型、证据规则、无答案题的检查范围）
 .venv/Scripts/python.exe -m evaluation.scripts.validate_dataset \
-    evaluation/datasets/qa_cases_v2.jsonl --min-cases 24
+    evaluation/datasets/qa_cases_v2.jsonl --min-cases 30
 
 # 引文逐字复核：重新抽取 4 份文档，断言 quote 出现在指定页/张/章节
 .venv/Scripts/python.exe -m evaluation.scripts.verify_evidence
