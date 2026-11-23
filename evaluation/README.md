@@ -155,6 +155,45 @@ evaluation/
 
 报告给出 7 项指标（Hit@K、MRR、Recall@K、Answer Correctness、Citation Validity、Citation Support、Refusal Accuracy）的**总体 + 分题型**结果。`citation_valid`（编号是否存在）与 `citation_supported`（内容是否真的支持）分开统计。
 
+## 批量评测（P0 加固）
+
+`evaluation/scripts/run_batch_e2e.py` 用于 30 题批量运行，具备：
+
+- **逐题隔离**：单题异常只记一条 `failed`，不中断批次；
+- **即时落盘**：每题结束追加 `per_case.jsonl` 并 `flush + fsync`；
+- **断点续跑**：`--resume` 只跳过“成功且配置指纹一致”的题，失败题会重跑；
+- **有限重试**：429/5xx/超时最多 `--max-retries` 次，指数退避（默认 2 次、2s 起）；
+- **运行清单**：`run_manifest.json` 记录 Git commit、代码/数据集/索引/检索哈希、模型、Top-K、起止时间；**不含任何密钥**；
+- **结果重建**：`--rebuild-only` 可从 `per_case.jsonl` 重新生成 `answers.json`、`predictions.jsonl`、`failures.json`、`report_auto.json`。
+
+```sh
+# 断点续跑（真实运行；--env-file 指向本地 .env）
+python -m evaluation.scripts.run_batch_e2e \
+    --retrieval E:/dsh_workplace/.eval-data/retrieval-real/1024-256-vector-k5/retrieval.json \
+    --out-dir .eval-batch/1024-256-vector-k5 --env-file .env --resume
+
+# 从逐题记录重建输出（不调用模型）
+python -m evaluation.scripts.run_batch_e2e --out-dir .eval-batch/1024-256-vector-k5 \
+    --rebuild-only
+```
+
+评分表生成已泛化到任意题数：`evaluation/scripts/make_grading.py`（默认渲染全部数据集题目，缺失题目标注“未作答”，不会覆盖已有文件，除非 `--force`）。
+
+## 状态语义
+
+| 状态 | 标识 |
+|---|---|
+| 真实运行 | `answers.json` / `report_auto.json` 中 `simulated: false` |
+| 模拟运行 | `simulated: true`；报告带 SIMULATED 横幅 |
+| 失败 | `failures.json` 中的 `failed` 记录，含错误类型与是否可重试 |
+| 未运行 | `failures.json.missing` |
+| 未评分 | 无标签 → 指标为 `null`（不是 0） |
+| 不适用 | 无引用题的 `citation_supported` 记「不适用（无引用）」 |
+
+## 后续必做实验：512/128 第二套索引
+
+512/128 不是可选项：**A 负责确认第二套分块方案并交付索引**，D 负责构建适配与评测（可用同一 `build_indexes.py --profile 512-128` 在评测侧复现，但需 A 确认参数与索引归属）。
+
 ## 当前状态（真实进度）
 
 - 数据集：**30/30 题**已完成，题型分布 12/8/5/5，43 条引文全部通过逐字复核。
