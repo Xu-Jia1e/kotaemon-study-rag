@@ -30,13 +30,18 @@ from kotaemon.indices.qa.citation_qa import (
 )
 from kotaemon.indices.qa.citation_qa_inline import AnswerWithInlineCitation
 from kotaemon.indices.qa.format_context import PrepareEvidencePipeline
-from kotaemon.indices.qa.utils import replace_think_tag_with_details
+from kotaemon.indices.qa.utils import is_abstention, replace_think_tag_with_details
 from kotaemon.llms import ChatLLM
 
 from ..utils import SUPPORTED_LANGUAGE_MAP
 from .base import BaseReasoning
 
 logger = logging.getLogger(__name__)
+
+INSUFFICIENT_EVIDENCE_MESSAGE = (
+    "Insufficient evidence to answer from the provided materials."
+)
+UNVERIFIED_CITATIONS_MESSAGE = "Some citations could not be verified against sources."
 
 
 class AddQueryContextPipeline(BaseComponent):
@@ -92,6 +97,8 @@ class FullQAPipeline(BaseReasoning):
     # configuration parameters
     trigger_context: int = 150
     use_rewrite: bool = False
+    enable_abstention: bool = True
+    strict_citation_validation: bool = True
 
     retrievers: list[BaseComponent]
 
@@ -220,6 +227,36 @@ class FullQAPipeline(BaseReasoning):
 
         return plot_content
 
+    def surface_grounding_status(
+        self, answer, with_citation, without_citation
+    ) -> Generator[Document, None, None]:
+        """Surface abstention and unverified-citation notices on the info panel.
+
+        Shared by ``FullQAPipeline`` and ``FullDecomposeQAPipeline`` so the two
+        paths stay aligned.
+        """
+        if not self.enable_abstention:
+            return
+
+        if is_abstention(answer.text) or (not with_citation and not without_citation):
+            yield Document(
+                channel="info",
+                content=f"<h5>{INSUFFICIENT_EVIDENCE_MESSAGE}</h5>",
+            )
+
+        if not self.strict_citation_validation:
+            return
+
+        validation = answer.metadata.get("citation_validation") or {}
+        if answer.metadata.get("citation_status") == "failed":
+            yield Document(
+                channel="info", content=f"<h5>{UNVERIFIED_CITATIONS_MESSAGE}</h5>"
+            )
+        elif validation and not validation.get("citation_valid", True):
+            yield Document(
+                channel="info", content=f"<h5>{UNVERIFIED_CITATIONS_MESSAGE}</h5>"
+            )
+
     def show_citations_and_addons(self, answer, docs, question):
         # show the evidence
         with_citation, without_citation = self.answering_pipeline.prepare_citations(
@@ -228,8 +265,13 @@ class FullQAPipeline(BaseReasoning):
         mindmap_output = self.prepare_mindmap(answer)
         citation_plot_output = self.prepare_citation_viz(answer, question, docs)
 
+        grounding_notices = list(
+            self.surface_grounding_status(answer, with_citation, without_citation)
+        )
+
         if not with_citation and not without_citation:
             yield Document(channel="info", content="<h5><b>No evidence found.</b></h5>")
+            yield from grounding_notices
         else:
             # clear the Info panel
             max_llm_rerank_score = max(
@@ -246,6 +288,9 @@ class FullQAPipeline(BaseReasoning):
             # yield citation plot output
             if citation_plot_output:
                 yield citation_plot_output
+
+            # surface abstention / unverified citation notices
+            yield from grounding_notices
 
             # yield warning message
             if has_llm_score and max_llm_rerank_score < CONTEXT_RELEVANT_WARNING_SCORE:
@@ -292,7 +337,11 @@ class FullQAPipeline(BaseReasoning):
         print(f"Got {len(docs)} retrieved documents")
         yield from infos
 
-        evidence_mode, evidence, images = self.evidence_pipeline(docs).content
+        evidence_doc = self.evidence_pipeline(docs)
+        evidence_mode, evidence, images = evidence_doc.content
+        self.answering_pipeline.evidence_index = list(
+            evidence_doc.metadata.get("evidence_index", [])
+        )
 
         def generate_relevant_scores():
             nonlocal docs
@@ -360,6 +409,11 @@ class FullQAPipeline(BaseReasoning):
         # answering pipeline configuration
         use_inline_citation = settings[f"{prefix}.highlight_citation"] == "inline"
 
+        enable_abstention = settings.get(f"{prefix}.enable_abstention", True)
+        strict_citation_validation = settings.get(
+            f"{prefix}.strict_citation_validation", True
+        )
+
         if use_inline_citation:
             answer_pipeline = pipeline.answering_pipeline = AnswerWithInlineCitation()
         else:
@@ -376,6 +430,12 @@ class FullQAPipeline(BaseReasoning):
         answer_pipeline.use_multimodal = settings[f"{prefix}.use_multimodal"]
         answer_pipeline.system_prompt = settings[f"{prefix}.system_prompt"]
         answer_pipeline.qa_template = settings[f"{prefix}.qa_prompt"]
+        answer_pipeline.enable_abstention = enable_abstention
+        answer_pipeline.enable_citation_validation = strict_citation_validation
+
+        pipeline.enable_abstention = enable_abstention
+        pipeline.strict_citation_validation = strict_citation_validation
+
         answer_pipeline.lang = SUPPORTED_LANGUAGE_MAP.get(
             settings["reasoning.lang"], "English"
         )
@@ -430,6 +490,24 @@ class FullQAPipeline(BaseReasoning):
                     ("citation: inline", "inline"),
                     ("no citation", "off"),
                 ],
+            },
+            "enable_abstention": {
+                "name": "Abstain when evidence is insufficient",
+                "value": True,
+                "component": "checkbox",
+                "info": (
+                    "Instruct the model to reply with an abstention message when "
+                    "the retrieved context is empty or does not support an answer."
+                ),
+            },
+            "strict_citation_validation": {
+                "name": "Validate citations against sources",
+                "value": True,
+                "component": "checkbox",
+                "info": (
+                    "Check cited indices against the retrieved evidence and warn "
+                    "when citations cannot be verified against sources."
+                ),
             },
             "create_mindmap": {
                 "name": "Create Mindmap",
@@ -501,7 +579,11 @@ class FullDecomposeQAPipeline(FullQAPipeline):
 
             yield from infos
 
-            evidence_mode, evidence, images = self.evidence_pipeline(docs).content
+            evidence_doc = self.evidence_pipeline(docs)
+            evidence_mode, evidence, images = evidence_doc.content
+            self.answering_pipeline.evidence_index = list(
+                evidence_doc.metadata.get("evidence_index", [])
+            )
             answer = yield from self.answering_pipeline.stream(
                 question=message,
                 history=history,
@@ -551,7 +633,11 @@ class FullDecomposeQAPipeline(FullQAPipeline):
         print(f"Got {len(docs)} retrieved documents")
         yield from infos
 
-        evidence_mode, evidence, images = self.evidence_pipeline(docs).content
+        evidence_doc = self.evidence_pipeline(docs)
+        evidence_mode, evidence, images = evidence_doc.content
+        self.answering_pipeline.evidence_index = list(
+            evidence_doc.metadata.get("evidence_index", [])
+        )
         answer = yield from self.answering_pipeline.stream(
             question=message,
             history=history,
@@ -566,10 +652,15 @@ class FullDecomposeQAPipeline(FullQAPipeline):
         with_citation, without_citation = self.answering_pipeline.prepare_citations(
             answer, docs
         )
+        grounding_notices = list(
+            self.surface_grounding_status(answer, with_citation, without_citation)
+        )
         if not with_citation and not without_citation:
             yield Document(channel="info", content="<h5><b>No evidence found.</b></h5>")
+            yield from grounding_notices
         else:
             yield Document(channel="info", content=None)
+            yield from grounding_notices
             yield from with_citation
             yield from without_citation
 
