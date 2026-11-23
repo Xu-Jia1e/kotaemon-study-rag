@@ -117,14 +117,14 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 - 支持证据组：同组可选、跨组必中，用于双证据/多问句题。
 - 无答案题必须带 `checked_scope`（检查了哪些文件、用什么方法、可机器复核的缺失证据）。
 
-**正式数据集 `qa_cases_v2.jsonl`：24 题**，分布 `direct 12 / synthesis 6 / detail 3 / unanswerable 3`，共 34 条证据引文。
+**正式数据集 `qa_cases_v2.jsonl`：30 题**，分布 `direct 12 / synthesis 8 / detail 5 / unanswerable 5`，共 43 条证据引文。
 
 数据来源是 4 份校验过 SHA-256 的真实文档：`11-hash2.pdf`（37 页）、`11-hash2.pptx`（37 张）、`USTC-ClassIn.pdf`（16 页）、`USST-syllabus.docx`（模板）。
 
 选题约束（避免"看起来合理但没依据"的题）：
 
 1. 只使用 **文本层可提取** 的内容。PDF 里的公式排版、槽位示意表在文本层是乱序的，凡无法逐字核对的片段一律不出题。
-2. `USST-syllabus.docx` 是空白模板，只有"桥梁工程的基本知识（示例）"一行有真实内容，因此只从该行出题（学生两项任务），另出一道无答案题（学分/学时字段为空）。
+2. `USST-syllabus.docx` 是空白模板，只有"桥梁工程的基本知识（示例）"一行有真实内容，因此从该行出教学重点/难点/预期成果、学生任务与思政资源题，另出一道无答案题（学分/学时字段为空）。
 3. `unanswerable` 题必须能机器验证"缺失"：`absent_phrases` 在全库无命中、`max_mentions` 限制提及次数（如 cuckoo 仅出现 1 次且只有名称）、或 `blank_fields` 断言字段行不含数字。
 
 复核命令：
@@ -175,7 +175,7 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 | 交付物 | 位置 | 状态 |
 |---|---|---|
 | 统一数据格式 | `evaluation/datasets/schema.md` | ✅ |
-| 24 题正式数据集 | `evaluation/datasets/qa_cases_v2.jsonl` | ✅ 12/6/3/3，34 条引文逐字复核 |
+| 30 题正式数据集 | `evaluation/datasets/qa_cases_v2.jsonl` | ✅ 12/8/5/5，43 条引文逐字复核 |
 | 引文复核工具 | `evaluation/scripts/verify_evidence.py` | ✅ 0 error |
 | 指标实现 | `evaluation/metrics/*.py` | ✅ |
 | 离线单测 | `evaluation/tests/` | ✅ 全绿 |
@@ -196,7 +196,7 @@ balanced_accuracy  = (refusal_accuracy + (1 - false_refusal_rate)) / 2
 | Top-K | `3`、`5`、`10` | 3 |
 | Reranking | `off`（默认）；`on` 为可选 | 1 / 1 |
 
-主矩阵 = 2 × 3 × 3 = **18 组**，全部使用**同一份** `datasets/qa_cases_v2.jsonl`（24 题）。报告里记录该文件 SHA-256，避免"换了数据集却说同一组实验"。
+主矩阵 = 2 × 3 × 3 = **18 组**，全部使用**同一份** `datasets/qa_cases_v2.jsonl`（30 题）。报告里记录该文件 SHA-256，避免"换了数据集却说同一组实验"。
 
 Reranking 不进入主矩阵：`on` 状态是 **blocked**（Cohere key 为空时重排原样返回；qwen3-rerank 未接入），所以不存在"已实现重排"的实验。
 
@@ -243,7 +243,7 @@ Reranking 不进入主矩阵：`on` 状态是 **blocked**（Cohere key 为空时
 
 ### 8.6 当前结论（明确声明）
 
-1. 正式测试集是 `datasets/qa_cases_v2.jsonl`，**24 题**（12 直接 / 6 综合 / 3 细节 / 3 无答案）。
+1. 正式测试集是 `datasets/qa_cases_v2.jsonl`，**30 题**（12 直接 / 8 综合 / 5 细节 / 5 无答案）。
 2. 数据来源只有 **4 份可读取文档**：`11-hash2.pdf`、`11-hash2.pptx`、`USTC-ClassIn.pdf`、`USST-syllabus.docx`。
 3. `UTS-accessible-word.docx` 与 `UTS-accessible-powerpoint.pptx` 因源站 **HTTP 403 未纳入**。
 4. **尚未完成任何真实检索或问答实验**：18 组实验全部 blocked，`results/` 为空。

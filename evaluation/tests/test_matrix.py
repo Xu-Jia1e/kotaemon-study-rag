@@ -54,7 +54,7 @@ def test_reranking_is_off_by_default_and_on_is_blocked():
 
 def test_all_cells_share_the_same_dataset():
     manifest = dataset_manifest()
-    assert manifest["cases"] == 24
+    assert manifest["cases"] == 30
     assert manifest["path"] == "evaluation/datasets/qa_cases_v2.jsonl"
     expected = hashlib.sha256(DATASET_PATH.read_bytes()).hexdigest()
     assert manifest["sha256"] == expected

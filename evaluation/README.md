@@ -8,14 +8,14 @@
 
 ## 正式数据集：`datasets/qa_cases_v2.jsonl`
 
-24 道题，全部基于**已校验的真实文档**，每题都有文档名、页码/幻灯片号、章节或表格行，以及原文片段。
+30 道题，全部基于**已校验的真实文档**，每题都有文档名、页码/幻灯片号、章节或表格行，以及原文片段。
 
 | 题型 | 数量 | 说明 |
 |---|---:|---|
 | `direct` 直接事实题 | 12 | 单个证据点、答案在原文中直接给出 |
-| `synthesis` 综合理解题 | 6 | 每题 ≥2 个证据组，需跨页/跨段整合（例如二次探测证明三步、三种探测策略对比） |
-| `detail` 细节定位题 | 3 | 定位到具体页/张的一行或一个符号（如 long 字段哈希写法、墓碑符号 🪦） |
-| `unanswerable` 无答案题 | 3 | 知识库确实没有答案，且记录了检查范围与可机器复核的缺失证据 |
+| `synthesis` 综合理解题 | 8 | 每题 ≥2 个证据组，需跨页/跨段整合（多证据整合，不宣称深度推理） |
+| `detail` 细节定位题 | 5 | 定位到具体页/张的一行或一个符号（如 long 字段哈希写法、墓碑符号 🪦） |
+| `unanswerable` 无答案题 | 5 | 知识库确实没有答案，且记录了检查范围与可机器复核的缺失证据 |
 
 > `datasets/qa_cases.jsonl`（原 6 道 search-cases 转换）**已废弃**，仅保留作历史对照，不参与任何评测。按约定不再修改或补齐。
 
@@ -42,7 +42,7 @@ python test-materials/download_samples.py   # 前两份
 # 环境（仓库根目录）
 uv sync --locked --package kotaemon --package ktem
 
-# 1. 结构校验（24 题、题型分布、字段规则、无答案题的检查范围）
+# 1. 结构校验（30 题、题型分布、字段规则、无答案题的检查范围）
 .venv/Scripts/python.exe -m evaluation.scripts.validate_dataset \
     evaluation/datasets/qa_cases_v2.jsonl --min-cases 24
 
@@ -84,7 +84,7 @@ evaluation/
 ├── DESIGN.md              接口检查结论、指标定义、实验矩阵、协作事项
 ├── datasets/
 │   ├── schema.md          JSONL 字段规范（含证据分组、无答案题的检查范围）
-│   ├── qa_cases_v2.jsonl  ✅ 正式数据集：24 题
+│   ├── qa_cases_v2.jsonl  ✅ 正式数据集：30 题
 │   ├── qa_cases.jsonl     ⚠️ 已废弃：原 6 道 search-cases，仅作历史对照
 │   └── candidates.md      v2 的选题依据与后续扩充方向
 ├── metrics/               retrieval / answer / citation 指标（纯函数）
@@ -145,7 +145,7 @@ evaluation/
 | Top-K | `3`、`5`、`10` |
 | Reranking | `off`（默认）；`on` 可选且 blocked |
 
-2 × 3 × 3 = 18 组，**全部使用同一份 24 题数据集**（报告记录其 SHA-256）。
+2 × 3 × 3 = 18 组，**全部使用同一份 30 题数据集**（报告记录其 SHA-256）。
 
 当前 **0 ready / 18 blocked**，原因是：两套 chunking 索引都不在本机可查、检索需要真实 embedding key、reranker 未接入。`run_experiment --matrix` 只输状态表，**不产出任何指标**；详见 [DESIGN.md §8](DESIGN.md)。
 
@@ -157,9 +157,9 @@ evaluation/
 
 ## 当前状态（真实进度）
 
-- 数据集：**24/24 题**已完成，题型分布 12/6/3/3，34 条引文全部通过逐字复核。
+- 数据集：**30/30 题**已完成，题型分布 12/8/5/5，43 条引文全部通过逐字复核。
 - 文档覆盖：hash 讲义（PDF 26 条引文、PPTX 1 条）、USTC 6 条、USST 1 条。**UTS 两份文档 403 不可得**，因此没有使用。
-- 无答案题：3 条，均记录 `checked_scope`（检查文件、方法、可机器复核的缺失证据）。
+- 无答案题：5 条，均记录 `checked_scope`（检查文件、方法、可机器复核的缺失证据）。
 - 适配器：`fixture` 可用；`part-b` 已实现但**尚未对真实索引运行**（需要 B 的 `--index-dir` 与本地 `.env`）。
 - 实验矩阵：**18 组全部 blocked**（0 ready），原因见 [DESIGN.md §8](DESIGN.md)。
 - 真实实验：**一条都没有跑**，`results/` 为空是符合预期的；未完成真实检索与问答实验。

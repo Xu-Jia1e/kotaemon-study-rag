@@ -16,12 +16,12 @@ def cases() -> list[dict]:
     return load_cases(DATASET)
 
 
-def test_dataset_has_24_cases_and_requested_distribution(cases):
-    assert len(cases) == 24
+def test_dataset_has_30_cases_and_requested_distribution(cases):
+    assert len(cases) == 30
     counts: dict[str, int] = {}
     for case in cases:
         counts[case["category"]] = counts.get(case["category"], 0) + 1
-    assert counts == {"direct": 12, "detail": 3, "synthesis": 6, "unanswerable": 3}
+    assert counts == {"direct": 12, "synthesis": 8, "detail": 5, "unanswerable": 5}
 
 
 def test_ids_are_unique_and_prefixed(cases):

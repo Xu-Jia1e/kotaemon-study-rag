@@ -42,7 +42,7 @@ def test_simulated_run_produces_all_artefacts(tmp_path):
     records = [
         json.loads(line) for line in per_case.read_text(encoding="utf-8").splitlines()
     ]
-    assert len(records) == 24
+    assert len(records) == 30
     assert all(record["simulated"] is True for record in records)
     assert all(
         record["chunking_strategy"].startswith("SIMULATED") for record in records
@@ -67,7 +67,7 @@ def test_simulated_run_produces_all_artefacts(tmp_path):
     payload = json.loads(report_json.read_text(encoding="utf-8"))
     assert payload["report"]["simulated"] is True
     assert payload["cell"]["dataset_sha256"]
-    assert payload["report"]["overall"]["cases"] == 24
+    assert payload["report"]["overall"]["cases"] == 30
 
     markdown = report_md.read_text(encoding="utf-8")
     assert "SIMULATED" in markdown
