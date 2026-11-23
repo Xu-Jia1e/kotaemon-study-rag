@@ -11,6 +11,21 @@ EVIDENCE_MODE_TABLE = 1
 EVIDENCE_MODE_CHATBOT = 2
 EVIDENCE_MODE_FIGURE = 3
 
+TRUNCATION_MARKER = "... [context truncated]"
+
+
+def _evidence_entry(retrieved_item: RetrievedDocument, idx: int) -> dict:
+    """Build the structured reference for a numbered evidence chunk."""
+    metadata = retrieved_item.metadata
+    return {
+        "index": idx,
+        "doc_id": retrieved_item.doc_id,
+        "file_name": metadata.get("file_name", "-"),
+        "page_label": metadata.get("page_label"),
+        "section": metadata.get("section"),
+        "type": metadata.get("type", ""),
+    }
+
 
 class PrepareEvidencePipeline(BaseComponent):
     """Prepare the evidence text from the list of retrieved documents
@@ -20,16 +35,23 @@ class PrepareEvidencePipeline(BaseComponent):
     Args:
         trim_func: a callback function or a BaseComponent, that splits a large
             chunk of text into smaller ones. The first one will be retained.
+
+    Attributes:
+        number_chunks: when True, prefix each evidence block with a 1-based
+            `[n]` marker and expose the matching `evidence_index` on the returned
+            document metadata.
     """
 
     max_context_length: int = 32000
     trim_func: TokenSplitter | None = None
+    number_chunks: bool = True
 
     def run(self, docs: list[RetrievedDocument]) -> Document:
         evidence = ""
         images = []
         table_found = 0
         evidence_modes = []
+        evidence_index: list[dict] = []
 
         evidence_trim_func = (
             self.trim_func
@@ -45,6 +67,14 @@ class PrepareEvidencePipeline(BaseComponent):
                 ),
             )
         )
+
+        def marker(retrieved_item: RetrievedDocument) -> str:
+            """Return the `[n] ` prefix and register the chunk when numbered."""
+            if not self.number_chunks:
+                return ""
+            idx = len(evidence_index) + 1
+            evidence_index.append(_evidence_entry(retrieved_item, idx))
+            return f"[{idx}] "
 
         for _, retrieved_item in enumerate(docs):
             retrieved_content = ""
@@ -64,15 +94,15 @@ class PrepareEvidencePipeline(BaseComponent):
                     if retrieved_content not in evidence:
                         table_found += 1
                         evidence += (
-                            f"<br><b>Table from {source}</b>\n"
-                            + retrieved_content
-                            + "\n<br>"
+                            f"<br><b>{marker(retrieved_item)}"
+                            f"Table from {source}</b>\n" + retrieved_content + "\n<br>"
                         )
             elif retrieved_item.metadata.get("type", "") == "chatbot":
                 evidence_modes.append(EVIDENCE_MODE_CHATBOT)
                 retrieved_content = retrieved_item.metadata["window"]
                 evidence += (
-                    f"<br><b>Chatbot scenario from {filename} (Row {page})</b>\n"
+                    f"<br><b>{marker(retrieved_item)}"
+                    f"Chatbot scenario from {filename} (Row {page})</b>\n"
                     + retrieved_content
                     + "\n<br>"
                 )
@@ -81,7 +111,8 @@ class PrepareEvidencePipeline(BaseComponent):
                 retrieved_content = retrieved_item.metadata.get("image_origin", "")
                 retrieved_caption = html.escape(retrieved_item.get_content())
                 evidence += (
-                    f"<br><b>Figure from {source}</b>\n"
+                    f"<br><b>{marker(retrieved_item)}"
+                    f"Figure from {source}</b>\n"
                     + "<img width='85%' src='<src>' "
                     + f"alt='{retrieved_caption}'/>"
                     + "\n<br>"
@@ -95,9 +126,8 @@ class PrepareEvidencePipeline(BaseComponent):
                 retrieved_content = retrieved_content.replace("\n", " ")
                 if retrieved_content not in evidence:
                     evidence += (
-                        f"<br><b>Content from {source}: </b> "
-                        + retrieved_content
-                        + " \n<br>"
+                        f"<br><b>{marker(retrieved_item)}"
+                        f"Content from {source}: </b> " + retrieved_content + " \n<br>"
                     )
 
         # resolve evidence mode
@@ -109,9 +139,20 @@ class PrepareEvidencePipeline(BaseComponent):
 
         # trim context by trim_len
         print("len (original)", len(evidence))
+        truncated = False
         if evidence:
             texts = evidence_trim_func([Document(text=evidence)])
-            evidence = texts[0].text
+            trimmed = texts[0].text
+            truncated = len(trimmed) < len(evidence)
+            evidence = trimmed
             print("len (trimmed)", len(evidence))
+            if truncated:
+                evidence += " " + TRUNCATION_MARKER
 
-        return Document(content=(evidence_mode, evidence, images))
+        return Document(
+            content=(evidence_mode, evidence, images),
+            metadata={
+                "evidence_index": evidence_index,
+                "evidence_truncated": truncated,
+            },
+        )
