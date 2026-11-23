@@ -3,15 +3,22 @@ import sys
 from pathlib import Path
 
 # Importing ``kotaemon.indices.qa`` pulls in ``ktem``, whose DB engine reads
-# ``settings.KH_DATABASE`` at import time. The flow settings loader only reads
-# ``THEFLOW_SETTINGS_MODULE`` or a discoverable ``flowsettings.py``; in a bare CI
-# checkout pytest runs from ``libs/kotaemon`` where the repository's
-# ``flowsettings.py`` is not on the search path. Load it explicitly (mirroring the
-# app) so collection works without a ``.env``.
+# ``settings.KH_DATABASE`` at import time. ``conftest.py`` configures the flow
+# settings before any test module is collected; this block keeps the module
+# self-contained if it is imported outside pytest and makes sure ``KH_DATABASE``
+# is present even when the theflow singleton was already initialised.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-os.environ.setdefault("THEFLOW_SETTINGS_MODULE", "flowsettings")
+if (_REPO_ROOT / "flowsettings.py").is_file():
+    os.environ.setdefault("THEFLOW_SETTINGS_MODULE", "flowsettings")
+
+try:
+    from tests.conftest import _ensure_flow_settings
+
+    _ensure_flow_settings()
+except Exception:  # pragma: no cover - conftest is always loaded under pytest
+    pass
 
 import pytest  # noqa: E402
 

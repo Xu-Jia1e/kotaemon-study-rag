@@ -1,4 +1,58 @@
-import pytest
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+# The flow settings singleton (``theflow.settings.settings``) is initialised once
+# per process, on first access. Some test modules import ``kotaemon`` (and thus
+# ``theflow``) during collection; if that happens before the QA tests run, the
+# settings are frozen without ``flowsettings`` and ``ktem``'s ``KH_DATABASE``
+# lookup fails during import. Configure settings here, in conftest, because it is
+# imported before any test module is collected.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+# Only point the flow settings loader at the repository ``flowsettings`` when it
+# actually exists; otherwise let ``theflow`` fall back to its defaults (which
+# provide ``STORAGE``/``BASE_BACKEND``) and inject ``KH_*`` values below.
+_HAS_FLOWSETTINGS = (_REPO_ROOT / "flowsettings.py").is_file()
+if _HAS_FLOWSETTINGS:
+    os.environ.setdefault("THEFLOW_SETTINGS_MODULE", "flowsettings")
+
+
+def _ensure_flow_settings() -> None:
+    """Make sure ``theflow.settings`` exposes ``KH_DATABASE`` and friends.
+
+    Prefer the repository ``flowsettings``. Import ``theflow`` first so that
+    ``flowsettings``'s ``from theflow.settings.default import *`` does not
+    re-enter a partially-initialised ``theflow`` package (which would raise
+    ``Setting STORAGE not found``). If ``flowsettings`` still cannot be loaded
+    (e.g. a minimal CI environment), fall back to an isolated sqlite database
+    under a temporary directory so collection never needs a real database or
+    ``.env``.
+    """
+    if _HAS_FLOWSETTINGS:
+        try:
+            import theflow  # noqa: F401  (initialise the package before settings)
+
+            import flowsettings  # noqa: F401
+        except Exception:  # pragma: no cover - only on incomplete environments
+            pass
+
+    from theflow.settings import settings
+
+    if "KH_DATABASE" not in vars(settings):
+        fallback = Path(tempfile.gettempdir()) / "kotaemon_tests"
+        fallback.mkdir(parents=True, exist_ok=True)
+        settings.KH_DATABASE = f"sqlite:///{fallback / 'sql.db'}"
+    if "BASE_BACKEND" not in vars(settings):
+        settings.BASE_BACKEND = "sqlite"
+
+
+_ensure_flow_settings()
+
+
+import pytest  # noqa: E402
 
 
 @pytest.fixture(scope="function")
