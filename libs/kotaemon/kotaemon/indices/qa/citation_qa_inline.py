@@ -9,7 +9,12 @@ import numpy as np
 from kotaemon.base import AIMessage, Document, HumanMessage, SystemMessage
 from kotaemon.llms import PromptTemplate
 
-from .citation_qa import CITATION_TIMEOUT, MAX_IMAGES, AnswerWithContextPipeline
+from .citation_qa import (
+    CITATION_TIMEOUT,
+    MAX_IMAGES,
+    AnswerWithContextPipeline,
+    build_abstention_answer,
+)
 from .format_context import EVIDENCE_MODE_FIGURE
 from .utils import ABSTAIN_MARKER, find_start_end_phrase, validate_citations
 
@@ -204,16 +209,16 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
     ) -> Generator[Document, None, Document]:
         history = kwargs.get("history", [])
         print(f"Got {len(images)} images")
+
+        if self.enable_abstention and not (evidence or "").strip():
+            # No usable evidence: short-circuit before calling the LLM and
+            # return the canonical abstention response.
+            yield Document(channel="chat", content=ABSTAIN_MARKER)
+            return build_abstention_answer(citation_viz=self.enable_citation_viz)
+
         # check if evidence exists, use QA prompt
         if evidence:
             prompt, evidence = self.get_prompt(question, evidence, evidence_mode)
-        elif self.enable_abstention:
-            # No retrieved evidence: instruct the model to abstain instead of
-            # answering from its own parametric knowledge.
-            prompt = (
-                f"{ABSTAIN_MARKER} Reply with exactly that sentence and do not "
-                f"add any citations.\n\nQuestion: {question}\nANSWER:"
-            )
         else:
             prompt = question
 
@@ -312,18 +317,15 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
 
         citation_validation = None
         max_id: int | None = None
-        if self.enable_citation_validation and evidence:
-            validation = validate_citations(final_answer or output, self.evidence_index)
-            citation_validation = validation.to_dict()
-            if self.evidence_index:
-                max_id = max(
-                    (
-                        entry["index"]
-                        for entry in self.evidence_index
-                        if isinstance(entry.get("index"), int)
-                    ),
-                    default=None,
-                )
+        if self.evidence_index:
+            max_id = max(
+                (
+                    entry["index"]
+                    for entry in self.evidence_index
+                    if isinstance(entry.get("index"), int)
+                ),
+                default=None,
+            )
 
         # convert citation to link
         answer = Document(
@@ -346,6 +348,75 @@ class AnswerWithInlineCitation(AnswerWithContextPipeline):
             yield Document(channel="chat", content=final_answer)
 
         return answer
+
+    def build_inline_citation_index(self, answer, docs) -> dict[int, dict]:
+        """Map inline citation numbers to the metadata of the source doc they
+        actually match.
+
+        In inline mode the model numbers citations ``【1】, 【2】`` according to the
+        order of its own emitted citation list (``CITATION【n】`` +
+        ``START/END_PHRASE``), not the input chunk order. Matching each emitted
+        span to its best document keeps validation aligned with what is
+        highlighted, instead of blindly trusting ``self.evidence_index``.
+        """
+        citation_index: dict[int, dict] = {}
+        citations = answer.metadata.get("citation") or []
+
+        doc_by_id = {doc.doc_id: doc for doc in docs}
+        id_by_index = {
+            entry["index"]: entry.get("doc_id")
+            for entry in (self.evidence_index or [])
+            if isinstance(entry.get("index"), int)
+        }
+
+        for e_id, evidence in enumerate(citations):
+            idx = evidence.idx if evidence.idx is not None else e_id + 1
+
+            best_doc_id = None
+            best_match_length = -1
+            for doc in docs:
+                match, match_length = find_start_end_phrase(
+                    evidence.start_phrase, evidence.end_phrase, doc.text
+                )
+                if match is not None and match_length > best_match_length:
+                    best_match_length = match_length
+                    best_doc_id = doc.doc_id
+
+            if best_doc_id is None:
+                # Fall back to the input-order mapping so an unmatched span can
+                # still be flagged rather than silently dropped.
+                best_doc_id = id_by_index.get(idx)
+
+            doc = doc_by_id.get(best_doc_id) if best_doc_id is not None else None
+            entry = next(
+                (
+                    item
+                    for item in (self.evidence_index or [])
+                    if item.get("doc_id") == best_doc_id
+                ),
+                None,
+            )
+            if entry is None and doc is not None:
+                entry = {
+                    "doc_id": doc.doc_id,
+                    "file_name": doc.metadata.get("file_name"),
+                    "page_label": doc.metadata.get("page_label"),
+                    "section": doc.metadata.get("section"),
+                    "type": doc.metadata.get("type", ""),
+                }
+            if entry is not None:
+                citation_index[idx] = {**entry, "index": idx}
+
+        return citation_index
+
+    def prepare_citations(self, answer, docs):
+        """Prepare UI citations and validate inline numbering against sources."""
+        if self.enable_citation_validation and docs:
+            index = self.build_inline_citation_index(answer, docs)
+            answer.metadata["citation_validation"] = validate_citations(
+                answer.text or "", list(index.values())
+            ).to_dict()
+        return super().prepare_citations(answer, docs)
 
     def match_evidence_with_context(self, answer, docs) -> dict[str, list[dict]]:
         """Match the evidence with the context"""

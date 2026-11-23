@@ -1,17 +1,44 @@
-import pytest
+import os
+import sys
+from pathlib import Path
 
-from kotaemon.base import RetrievedDocument
-from kotaemon.indices.qa.citation import CiteEvidence
-from kotaemon.indices.qa.citation_qa import (
+# Importing ``kotaemon.indices.qa`` pulls in ``ktem``, whose DB engine reads
+# ``settings.KH_DATABASE`` at import time. ``conftest.py`` configures the flow
+# settings before any test module is collected; this block keeps the module
+# self-contained if it is imported outside pytest and makes sure ``KH_DATABASE``
+# is present even when the theflow singleton was already initialised.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+if (_REPO_ROOT / "flowsettings.py").is_file():
+    os.environ.setdefault("THEFLOW_SETTINGS_MODULE", "flowsettings")
+
+try:
+    from tests.conftest import _ensure_flow_settings
+
+    _ensure_flow_settings()
+except Exception:  # pragma: no cover - conftest is always loaded under pytest
+    pass
+
+import pytest  # noqa: E402
+
+from kotaemon.base import Document, LLMInterface, RetrievedDocument  # noqa: E402
+from kotaemon.indices.qa.citation import CiteEvidence  # noqa: E402
+from kotaemon.indices.qa.citation_qa import (  # noqa: E402
+    AnswerWithContextPipeline,
+    build_abstention_answer,
     build_abstention_prompt,
     build_citation_metadata,
 )
-from kotaemon.indices.qa.citation_qa_inline import AnswerWithInlineCitation
-from kotaemon.indices.qa.format_context import (
+from kotaemon.indices.qa.citation_qa_inline import (  # noqa: E402
+    AnswerWithInlineCitation,
+    InlineEvidence,
+)
+from kotaemon.indices.qa.format_context import (  # noqa: E402
     TRUNCATION_MARKER,
     PrepareEvidencePipeline,
 )
-from kotaemon.indices.qa.utils import (
+from kotaemon.indices.qa.utils import (  # noqa: E402
     ABSTAIN_MARKER,
     find_start_end_phrase,
     find_text,
@@ -19,6 +46,36 @@ from kotaemon.indices.qa.utils import (
     parse_citation_indices,
     validate_citations,
 )
+from kotaemon.llms import ChatLLM  # noqa: E402
+
+
+class MockChatLLM(ChatLLM):
+    """A real ``ChatLLM`` component that returns a fixed answer.
+
+    Subclassing ``ChatLLM`` keeps theflow's component wrapping intact so the
+    pipeline can call ``stream``/``invoke`` without a live model.
+    """
+
+    reply: str = "A concrete answer【1】."
+    called: bool = False
+
+    def invoke(self, *args, **kwargs):
+        return LLMInterface(text=self.reply)
+
+    def stream(self, *args, **kwargs):
+        MockChatLLM.called = True
+        for token in self.reply.split(" "):
+            yield LLMInterface(text=token + " ")
+
+
+def _run(gen):
+    """Drain a generator pipeline, returning (chunks, final_answer)."""
+    chunks = []
+    try:
+        while True:
+            chunks.append(next(gen))
+    except StopIteration as stop:
+        return chunks, stop.value
 
 
 def _doc(text: str, doc_id: str, **metadata) -> RetrievedDocument:
@@ -290,3 +347,238 @@ def test_find_start_end_phrase_matches_span():
 def test_cite_evidence_model_holds_quotes():
     evidence = CiteEvidence(evidences=["direct quote one", "direct quote two"])
     assert evidence.evidences == ["direct quote one", "direct quote two"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: truncation must drop excluded chunks from evidence_index
+# ---------------------------------------------------------------------------
+
+
+def test_truncation_drops_excluded_chunks_from_evidence_index():
+    docs = [
+        _doc("alpha beta gamma delta epsilon.", "a", file_name="a.pdf"),
+        _doc("zeta eta theta iota kappa.", "b", file_name="b.pdf"),
+        _doc("lambda mu nu xi omicron.", "c", file_name="c.pdf"),
+    ]
+    pipeline = PrepareEvidencePipeline(max_context_length=40)
+    output = pipeline(docs)
+    _, evidence, _ = output.content
+    index = output.metadata["evidence_index"]
+
+    surviving_indices = {entry["index"] for entry in index}
+    # Only chunks whose block survived into the trimmed evidence are indexed.
+    for entry in index:
+        assert f"[{entry['index']}]" in evidence
+
+    # At least one later chunk must have been dropped by the small budget.
+    assert len(index) < len(docs)
+    assert surviving_indices.issubset({1, 2, 3})
+
+    # Citing a dropped chunk is flagged invalid.
+    dropped = next(i for i in (1, 2, 3) if i not in surviving_indices)
+    result = validate_citations(f"Claim about a dropped chunk【{dropped}】.", index)
+    assert dropped in result.invalid_citation_ids
+    assert result.citation_valid is False
+
+
+def test_truncation_keeps_everything_when_budget_is_large():
+    docs = [
+        _doc("alpha beta.", "a", file_name="a.pdf"),
+        _doc("gamma delta.", "b", file_name="b.pdf"),
+    ]
+    output = PrepareEvidencePipeline(max_context_length=32000)(docs)
+    assert output.metadata["evidence_truncated"] is False
+    assert [entry["index"] for entry in output.metadata["evidence_index"]] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: zero-evidence abstention short-circuits before calling the LLM
+# ---------------------------------------------------------------------------
+
+
+def test_standard_mode_empty_evidence_skips_llm():
+    pipeline = AnswerWithContextPipeline()
+    pipeline.llm = MockChatLLM(reply="A confident but ungrounded answer.")
+    pipeline.enable_abstention = True
+    MockChatLLM.called = False
+
+    chunks, answer = _run(pipeline.stream(question="What is chunking?", evidence=""))
+
+    assert MockChatLLM.called is False
+    assert answer.text == ABSTAIN_MARKER
+    assert answer.metadata["citation_status"] == "abstained"
+    assert any(ABSTAIN_MARKER in (chunk.content or "") for chunk in chunks)
+
+
+def test_standard_mode_whitespace_evidence_skips_llm():
+    pipeline = AnswerWithContextPipeline()
+    pipeline.llm = MockChatLLM(reply="A confident but ungrounded answer.")
+    pipeline.enable_abstention = True
+    MockChatLLM.called = False
+
+    _, answer = _run(pipeline.stream(question="q", evidence="   \n\t  "))
+
+    assert MockChatLLM.called is False
+    assert answer.text == ABSTAIN_MARKER
+
+
+def test_inline_mode_empty_evidence_skips_llm():
+    pipeline = AnswerWithInlineCitation()
+    pipeline.llm = MockChatLLM(reply="A confident but ungrounded answer【1】.")
+    pipeline.enable_abstention = True
+    MockChatLLM.called = False
+
+    chunks, answer = _run(pipeline.stream(question="What is chunking?", evidence=""))
+
+    assert MockChatLLM.called is False
+    assert answer.text == ABSTAIN_MARKER
+    assert answer.metadata["citation_status"] == "abstained"
+    assert any(ABSTAIN_MARKER in (chunk.content or "") for chunk in chunks)
+
+
+def test_abstention_disabled_still_calls_llm_on_empty_evidence():
+    pipeline = AnswerWithContextPipeline()
+    pipeline.llm = MockChatLLM(reply="A concrete answer.")
+    pipeline.enable_abstention = False
+    MockChatLLM.called = False
+
+    chunks, answer = _run(pipeline.stream(question="q", evidence=""))
+
+    assert MockChatLLM.called is True
+    assert answer.text.strip() != ABSTAIN_MARKER
+
+
+def test_build_abstention_answer_has_no_citation():
+    answer = build_abstention_answer(citation_viz=True)
+    assert answer.text == ABSTAIN_MARKER
+    assert answer.metadata["citation"] is None
+    assert answer.metadata["citation_status"] == "abstained"
+    assert answer.metadata["citation_viz"] is True
+
+
+# ---------------------------------------------------------------------------
+# End-to-end answering flows with grounded evidence
+# ---------------------------------------------------------------------------
+
+
+def test_standard_mode_end_to_end_grounded_answer():
+    docs = [
+        _doc("alpha fact about chunking.", "a", file_name="a.pdf", page_label="1"),
+        _doc("beta fact about retrieval.", "b", file_name="b.pdf", page_label="2"),
+    ]
+    evidence_doc = PrepareEvidencePipeline()(docs)
+    _, evidence, _ = evidence_doc.content
+
+    pipeline = AnswerWithContextPipeline()
+    pipeline.llm = MockChatLLM(reply="Chunking is efficient【1】.")
+    pipeline.enable_abstention = True
+    pipeline.enable_citation = False
+    pipeline.enable_citation_validation = True
+    pipeline.evidence_index = evidence_doc.metadata["evidence_index"]
+    MockChatLLM.called = False
+
+    chunks, answer = _run(pipeline.stream(question="q", evidence=evidence))
+
+    assert MockChatLLM.called is True
+    assert "Chunking is efficient" in answer.text
+    validation = answer.metadata["citation_validation"]
+    assert validation["citation_valid"] is True
+    assert validation["cited_indices"] == [1]
+    assert validation["sources"][0]["file_name"] == "a.pdf"
+
+
+def test_standard_mode_end_to_end_invalid_citation_flagged():
+    docs = [_doc("alpha fact.", "a", file_name="a.pdf", page_label="1")]
+    evidence_doc = PrepareEvidencePipeline()(docs)
+    _, evidence, _ = evidence_doc.content
+
+    pipeline = AnswerWithContextPipeline()
+    pipeline.llm = MockChatLLM(reply="Grounded claim【9】.")
+    pipeline.enable_citation_validation = True
+    pipeline.evidence_index = evidence_doc.metadata["evidence_index"]
+
+    _, answer = _run(pipeline.stream(question="q", evidence=evidence))
+
+    validation = answer.metadata["citation_validation"]
+    assert validation["citation_valid"] is False
+    assert 9 in validation["invalid_citation_ids"]
+
+
+def test_inline_mode_end_to_end_returns_final_answer():
+    docs = [_doc("alpha fact about chunking.", "a", file_name="a.pdf", page_label="1")]
+    evidence_doc = PrepareEvidencePipeline()(docs)
+    _, evidence, _ = evidence_doc.content
+
+    reply = (
+        "CITATION LIST\n\n"
+        "CITATION【1】\n\n"
+        "START_PHRASE: alpha fact about chunking\n"
+        "END_PHRASE: alpha fact about chunking\n\n"
+        "FINAL ANSWER\n"
+        "Chunking is efficient【1】."
+    )
+    pipeline = AnswerWithInlineCitation()
+    pipeline.llm = MockChatLLM(reply=reply)
+    pipeline.enable_abstention = True
+    pipeline.enable_citation_validation = True
+    pipeline.evidence_index = evidence_doc.metadata["evidence_index"]
+
+    _, answer = _run(pipeline.stream(question="q", evidence=evidence))
+
+    assert "Chunking is efficient" in answer.text
+    assert answer.metadata["citation"][0].idx == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: inline citation numbers map to the matched source, not input order
+# ---------------------------------------------------------------------------
+
+
+def test_inline_citation_number_maps_to_matched_document():
+    docs = [
+        _doc("alpha fact about chunking efficiency.", "a", file_name="a.pdf"),
+        _doc("beta fact about retrieval quality.", "b", file_name="b.pdf"),
+    ]
+    # The inline ``【1】`` phrases match the SECOND document, not the first.
+    answer = Document(
+        text="Retrieval matters【1】.",
+        metadata={
+            "citation": [
+                InlineEvidence(
+                    start_phrase="beta fact about retrieval quality",
+                    end_phrase="beta fact about retrieval quality",
+                    idx=1,
+                )
+            ]
+        },
+    )
+
+    pipeline = AnswerWithInlineCitation()
+    pipeline.enable_citation_validation = True
+    pipeline.evidence_index = _evidence_index(*docs)
+
+    index = pipeline.build_inline_citation_index(answer, docs)
+    assert index[1]["doc_id"] == "b"
+    assert index[1]["file_name"] == "b.pdf"
+
+    pipeline.prepare_citations(answer, docs)
+    validation = answer.metadata["citation_validation"]
+    assert validation["citation_valid"] is True
+    assert validation["sources"][0]["doc_id"] == "b"
+    assert validation["sources"][0]["file_name"] == "b.pdf"
+
+
+def test_inline_citation_out_of_bounds_unmatched_flagged_invalid():
+    docs = [_doc("alpha fact about chunking.", "a", file_name="a.pdf")]
+    # Citation number 5 does not correspond to any emitted citation span.
+    answer = Document(text="Groundless claim【5】.", metadata={"citation": []})
+
+    pipeline = AnswerWithInlineCitation()
+    pipeline.enable_citation_validation = True
+    pipeline.evidence_index = _evidence_index(*docs)
+
+    index = pipeline.build_inline_citation_index(answer, docs)
+    # No inline spans -> empty mapped index; validation then flags the marker.
+    result = validate_citations(answer.text, list(index.values()))
+    assert result.citation_valid is False
+    assert result.invalid_citation_ids == [5]

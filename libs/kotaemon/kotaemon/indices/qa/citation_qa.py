@@ -75,6 +75,21 @@ def build_abstention_prompt(question: str) -> str:
     )
 
 
+def build_abstention_answer(*, qa_score=None, citation_viz: bool = False) -> Document:
+    """Build the canonical abstention answer without invoking the LLM."""
+    return Document(
+        text=ABSTAIN_MARKER,
+        metadata={
+            "citation_viz": citation_viz,
+            "mindmap": None,
+            "citation": None,
+            "citation_status": "abstained",
+            "citation_validation": None,
+            "qa_score": qa_score,
+        },
+    )
+
+
 DEFAULT_QA_TEXT_PROMPT = (
     "Use the following pieces of context to answer the question at the end in detail with clear explanation. "  # noqa: E501
     "If you don't know the answer, just say that you don't know, don't try to "
@@ -259,13 +274,16 @@ class AnswerWithContextPipeline(BaseComponent):
     ) -> Generator[Document, None, Document]:
         history = kwargs.get("history", [])
         print(f"Got {len(images)} images")
+
+        if self.enable_abstention and not (evidence or "").strip():
+            # No usable evidence: short-circuit before calling the LLM and
+            # return the canonical abstention response.
+            yield Document(channel="chat", content=ABSTAIN_MARKER)
+            return build_abstention_answer(citation_viz=self.enable_citation_viz)
+
         # check if evidence exists, use QA prompt
         if evidence:
             prompt, evidence = self.get_prompt(question, evidence, evidence_mode)
-        elif self.enable_abstention:
-            # No retrieved evidence: still steer the model to abstain instead of
-            # answering from its own parametric knowledge.
-            prompt = build_abstention_prompt(question)
         else:
             prompt = question
 

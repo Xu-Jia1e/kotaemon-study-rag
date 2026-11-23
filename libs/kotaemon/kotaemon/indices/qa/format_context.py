@@ -1,4 +1,5 @@
 import html
+import re
 from functools import partial
 
 import tiktoken
@@ -12,6 +13,8 @@ EVIDENCE_MODE_CHATBOT = 2
 EVIDENCE_MODE_FIGURE = 3
 
 TRUNCATION_MARKER = "... [context truncated]"
+
+_MARKER_PATTERN = re.compile(r"\[(\d+)\]")
 
 
 def _evidence_entry(retrieved_item: RetrievedDocument, idx: int) -> dict:
@@ -147,6 +150,13 @@ class PrepareEvidencePipeline(BaseComponent):
             evidence = trimmed
             print("len (trimmed)", len(evidence))
             if truncated:
+                # Only keep references to chunks whose blocks actually survived
+                # into the trimmed evidence, so citing a dropped chunk is not
+                # considered valid.
+                surviving = {int(match) for match in _MARKER_PATTERN.findall(evidence)}
+                evidence_index = [
+                    entry for entry in evidence_index if entry["index"] in surviving
+                ]
                 evidence += " " + TRUNCATION_MARKER
 
         return Document(
