@@ -1,0 +1,11 @@
+{
+  "_comment": "SYNTHETIC FIXTURE for adapter/metric tests. Not experimental data. Locators mirror the real sample documents so the matcher is exercised, but scores and texts are placeholders.",
+  "sc-01": [
+    {"chunk_id": "stub-a", "file": "11-hash2.pdf", "locator": {"kind": "page", "value": 17}, "text": "SYNTHETIC FIXTURE text: unrelated page", "score": 0.62},
+    {"chunk_id": "stub-b", "file": "11-hash2.pdf", "locator": {"kind": "page", "value": 25}, "text": "SYNTHETIC FIXTURE text: hash table slots", "score": 0.59}
+  ],
+  "sc-05": [
+    {"chunk_id": "stub-c", "file": "UTS-accessible-powerpoint.pptx", "locator": {"kind": "slide", "value": 4}, "text": "SYNTHETIC FIXTURE text: Review tab", "score": 0.71},
+    {"chunk_id": "stub-d", "file": "UTS-accessible-powerpoint.pptx", "locator": {"kind": "slide", "value": 17}, "text": "SYNTHETIC FIXTURE text: Banded Columns", "score": 0.66}
+  ]
+}
