@@ -22,7 +22,7 @@ from .format_context import (
     EVIDENCE_MODE_TABLE,
     EVIDENCE_MODE_TEXT,
 )
-from .utils import find_text
+from .utils import ABSTAIN_MARKER, find_text, validate_citations
 
 try:
     from ktem.llms.manager import llms
@@ -36,6 +36,44 @@ CITATION_TIMEOUT = 5.0
 CONTEXT_RELEVANT_WARNING_SCORE = config(
     "CONTEXT_RELEVANT_WARNING_SCORE", 0.3, cast=float
 )
+
+
+def build_citation_metadata(
+    *,
+    output: str,
+    evidence: str,
+    citation,
+    enable_citation: bool,
+    enable_citation_validation: bool,
+    evidence_index: list[dict],
+) -> dict:
+    """Compute citation status and validation for an answer.
+
+    Highlight mode fails when the citation pass returns ``None`` (timeout or
+    raised), so the caller can warn instead of presenting a verified
+    zero-citation answer. Validation maps ``【n】`` markers to ``evidence_index``.
+    """
+    citation_status = "ok"
+    if enable_citation and evidence and citation is None:
+        citation_status = "failed"
+
+    citation_validation = None
+    if enable_citation_validation and evidence:
+        citation_validation = validate_citations(output, evidence_index).to_dict()
+
+    return {
+        "citation_status": citation_status,
+        "citation_validation": citation_validation,
+    }
+
+
+def build_abstention_prompt(question: str) -> str:
+    """Prompt used when no evidence was retrieved and abstention is enabled."""
+    return (
+        f"{ABSTAIN_MARKER} Reply with exactly that sentence and do not "
+        f"add any citations.\n\nQuestion: {question}\nHelpful Answer:"
+    )
+
 
 DEFAULT_QA_TEXT_PROMPT = (
     "Use the following pieces of context to answer the question at the end in detail with clear explanation. "  # noqa: E501
@@ -79,6 +117,20 @@ DEFAULT_QA_FIGURE_PROMPT = (
     "Answer: "
 )  # noqa
 
+DEFAULT_QA_GROUNDED_PROMPT = (
+    "Answer the question using only the numbered context blocks below. Each block "
+    "starts with a marker such as [1], [2]. Cite the blocks you rely on using the "
+    "marker in the form 【1】 immediately after the statement, e.g. "
+    '"Fixed-size chunking is computationally efficient【1】.". '
+    "Use only markers that exist in the context. Do not invent sources. "
+    f"If the context is empty, or does not contain enough information to answer, "
+    f'reply exactly with: "{ABSTAIN_MARKER}" and do not add citations. '
+    "Give answer in {lang}.\n\n"
+    "{context}\n"
+    "Question: {question}\n"
+    "Helpful Answer:"
+)
+
 
 class AnswerWithContextPipeline(BaseComponent):
     """Answer the question based on the evidence
@@ -109,18 +161,28 @@ class AnswerWithContextPipeline(BaseComponent):
     qa_table_template: str = DEFAULT_QA_TABLE_PROMPT
     qa_chatbot_template: str = DEFAULT_QA_CHATBOT_PROMPT
     qa_figure_template: str = DEFAULT_QA_FIGURE_PROMPT
+    qa_grounded_template: str = DEFAULT_QA_GROUNDED_PROMPT
 
     enable_citation: bool = False
     enable_mindmap: bool = False
     enable_citation_viz: bool = False
+    enable_abstention: bool = True
+    enable_citation_validation: bool = True
 
     system_prompt: str = ""
     lang: str = "English"  # support English and Japanese
     n_last_interactions: int = 5
 
+    # Structured reference of the numbered evidence chunks, injected by the
+    # orchestrator (`PrepareEvidencePipeline`). Each item maps
+    # ``index -> {doc_id, file_name, page_label, section, type}``.
+    evidence_index: list[dict] = []
+
     def get_prompt(self, question, evidence, evidence_mode: int):
         """Prepare the prompt and other information for LLM"""
-        if evidence_mode == EVIDENCE_MODE_TEXT:
+        if self.enable_abstention and evidence_mode == EVIDENCE_MODE_TEXT:
+            prompt_template = PromptTemplate(self.qa_grounded_template)
+        elif evidence_mode == EVIDENCE_MODE_TEXT:
             prompt_template = PromptTemplate(self.qa_template)
         elif evidence_mode == EVIDENCE_MODE_TABLE:
             prompt_template = PromptTemplate(self.qa_table_template)
@@ -200,6 +262,10 @@ class AnswerWithContextPipeline(BaseComponent):
         # check if evidence exists, use QA prompt
         if evidence:
             prompt, evidence = self.get_prompt(question, evidence, evidence_mode)
+        elif self.enable_abstention:
+            # No retrieved evidence: still steer the model to abstain instead of
+            # answering from its own parametric knowledge.
+            prompt = build_abstention_prompt(question)
         else:
             prompt = question
 
@@ -281,12 +347,23 @@ class AnswerWithContextPipeline(BaseComponent):
         if mindmap_thread:
             mindmap_thread.join(timeout=CITATION_TIMEOUT)
 
+        status = build_citation_metadata(
+            output=output,
+            evidence=evidence,
+            citation=citation,
+            enable_citation=self.enable_citation,
+            enable_citation_validation=self.enable_citation_validation,
+            evidence_index=self.evidence_index,
+        )
+
         answer = Document(
             text=output,
             metadata={
                 "citation_viz": self.enable_citation_viz,
                 "mindmap": mindmap,
                 "citation": citation,
+                "citation_status": status["citation_status"],
+                "citation_validation": status["citation_validation"],
                 "qa_score": qa_score,
             },
         )
